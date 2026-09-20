@@ -1,0 +1,8 @@
+node_modules/
+workspaces/
+engine.log
+.env
+.env.local
+mcp_servers.json
+*.log
+.DS_Store
