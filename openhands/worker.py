@@ -208,6 +208,13 @@ def make_sink(state: dict[str, Any]) -> Any:
                 emit({"type": "error", "error": error})
             return
 
+        if kind == "ConversationErrorEvent":
+            detail = str(getattr(event, "detail", "") or getattr(event, "code", "") or "")[:500]
+            if detail:
+                state["errors"].append(detail)
+                emit({"type": "error", "error": detail})
+            return
+
         # Condensation / system / hook / other events: not part of the
         # stream vocabulary — ignored by design.
 
@@ -248,10 +255,14 @@ async def run_job(job: dict[str, Any]) -> int:
         api_key=api_key,
         **({"base_url": str(base_url)} if base_url else {}),
         drop_params=True,
-        num_retries=10,
-        retry_min_wait=8,
-        retry_max_wait=60,
+        # Fast failure surfacing: the engine-level NVIDIA lane switch takes
+        # over when the OpenRouter free tier is exhausted — a 10-retry
+        # ladder just grinds for ~8 dead minutes first (live-observed).
+        num_retries=4,
+        retry_min_wait=4,
+        retry_max_wait=20,
         timeout=600,  # a call may be slow; it may never hang forever
+        max_output_tokens=int(job.get("max_output_tokens") or 16384),
     )
 
     # THE mandate: one agent — the SDK's own default agent. cli_mode=True —
@@ -298,19 +309,23 @@ async def run_job(job: dict[str, Any]) -> int:
     status_obj = getattr(conversation, "execution_status", None)
     status_str = str(getattr(status_obj, "value", status_obj) or "").lower()
     summary = state["last_message"].strip()
-    issues = [e for e in state["errors"][:10]]
 
     if status_str in ("error", "stuck"):
         final_status = "incomplete"
+        issues = [e for e in state["errors"][:10]]
         if not summary:
             summary = f"The agent ended in state '{status_str}'."
         if status_str not in issues:
             issues.insert(0, f"conversation {status_str}")
     elif state["errors"] and not summary:
         final_status = "incomplete"
+        issues = [e for e in state["errors"][:10]]
         summary = "The agent ended with errors and no final answer."
     else:
+        # A finished run's transient tool errors were recovered by the
+        # agent itself — they are not "remaining" issues.
         final_status = "complete" if summary else "incomplete"
+        issues = [] if final_status == "complete" else [e for e in state["errors"][:10]]
         if not summary:
             summary = (
                 "The agent finished without a final message. Work done so far "

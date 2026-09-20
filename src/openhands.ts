@@ -100,6 +100,7 @@ export async function* runOpenHands(opts: OpenHandsRunOpts): AsyncGenerator<Open
       api_key: opts.llm.apiKey,
       ...(opts.llm.baseUrl ? { base_url: opts.llm.baseUrl } : {}),
       max_iterations: opts.maxIterations ?? (Number(process.env.OH_MAX_ITERATIONS || 0) || 500),
+      max_output_tokens: Number(process.env.OH_MAX_OUTPUT_TOKENS || 0) || 16384,
     }),
   );
 
