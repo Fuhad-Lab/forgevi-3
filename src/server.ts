@@ -25,9 +25,9 @@
  * Bun.serve, one process, no message bus behind it.
  */
 
-import { config, writeRuntimeConfigFile, runtimeConfigPath } from "./config.ts";
+import { config, writeRuntimeConfigFile, runtimeConfigPath, reloadEngineConfig } from "./config.ts";
 import { abortRun, activeRunCount, getLlmConfig, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, findLiveRunForProject, liveRunDevPort, type StartRunInput } from "./runs/manager.ts";
-import { probeOpenHands, probeOpenHandsSync, openrouterPool } from "./openhands.ts";
+import { probeOpenHands, probeOpenHandsSync, openrouterPool, reloadOpenRouterPool } from "./openhands.ts";
 import {
   projectFiles,
   projectReadFile,
@@ -42,8 +42,8 @@ import {
   validProjectId,
   studioSafePath,
 } from "./runs/workspace-service.ts";
-import { e2bBroker } from "./e2b-backblaze/sandbox.ts";
-import { b2BootstrapStatus } from "./e2b-backblaze/b2.ts";
+import { e2bBroker, reloadE2BBroker } from "./e2b-backblaze/sandbox.ts";
+import { b2BootstrapStatus, resetB2Bootstrap } from "./e2b-backblaze/b2.ts";
 import { redisConfigured } from "./redis.ts";
 import { loadRunEvents } from "./redis.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
@@ -329,13 +329,29 @@ const server = Bun.serve({
         return json({ error: "no valid values supplied" }, 400, origin);
       }
       const { written, denied } = writeRuntimeConfigFile(clean);
+      // HOT RELOAD (the deploy law): the pushed values take effect NOW —
+      // the config object mutates in place and every pool singleton
+      // rebuilds off it. No engine restart, no Render dashboard.
+      reloadEngineConfig();
+      reloadOpenRouterPool();
+      reloadE2BBroker();
+      resetB2Bootstrap();
+      // warm the B2 bootstrap so the next dashboard read reports it
+      void b2BootstrapStatus().catch(() => undefined);
       return json(
         {
           ok: true,
           applied: written,
           denied,
-          note: "values are in-memory now and persisted to the runtime config file — env vars (when set) still take precedence at boot",
+          note: "values are applied in-memory now (pools rebuilt) and persisted to the runtime config file — env vars (when set) still take precedence at boot",
           runtimeConfigPath: runtimeConfigPath(),
+          state: {
+            openrouterKeys: config.openrouterKeys.length,
+            e2bKeys: config.e2bKeys.length,
+            b2Configured: Boolean(config.b2),
+            redisConfigured: Boolean(config.redis),
+            modelChain: config.modelChain,
+          },
         },
         200,
         origin,

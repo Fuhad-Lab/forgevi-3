@@ -220,6 +220,12 @@ async function writeKeyCache(cache: S3KeyCache): Promise<void> {
 
 let resolvedPromise: Promise<ResolvedB2Credentials> | null = null;
 
+/** Reset the cached bootstrap (the config-push surface calls this when
+ *  B2 credentials change). */
+export function resetB2Bootstrap(): void {
+  resolvedPromise = null;
+}
+
 /** Resolve B2 S3 credentials — the self-healing bootstrap. */
 export function resolveB2Credentials(): Promise<ResolvedB2Credentials> {
   if (!resolvedPromise) {

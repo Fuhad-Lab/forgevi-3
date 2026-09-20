@@ -285,12 +285,22 @@ export class LocalSandbox implements SandboxAdapter {
 // ── THE E2B KEY POOL (module singleton — the broker is the one
 //    serialization point the 1-spawn/second law demands) ─────────────────
 
-export const e2bBroker = new KeyPoolBroker({
+export let e2bBroker = new KeyPoolBroker({
   keys: config.e2bKeys,
   maxSlotsPerKey: config.e2bSeatsPerKey,
   spawnThrottleMs: config.e2bSpawnThrottleMs,
   queueMax: config.e2bSpawnQueueMax,
 });
+
+/** Rebuild the broker after a config push (the deploy surface calls this). */
+export function reloadE2BBroker(): void {
+  e2bBroker = new KeyPoolBroker({
+    keys: config.e2bKeys,
+    maxSlotsPerKey: config.e2bSeatsPerKey,
+    spawnThrottleMs: config.e2bSpawnThrottleMs,
+    queueMax: config.e2bSpawnQueueMax,
+  });
+}
 
 /** Spawn through the pool — acquire → create → rollback on failure. */
 async function spawnPooledSandbox(template: string | undefined): Promise<{ sandbox: E2BSandbox; lease: Lease }> {

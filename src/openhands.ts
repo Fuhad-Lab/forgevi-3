@@ -21,7 +21,12 @@ export interface LlmConfig {
 }
 
 /** THE OPENROUTER POOL (module singleton — round-robin + 429/quota latching). */
-export const openrouterPool = new OpenRouterKeyPool(config.openrouterKeys);
+export let openrouterPool = new OpenRouterKeyPool(config.openrouterKeys);
+
+/** Rebuild the pool after a config push (the deploy surface calls this). */
+export function reloadOpenRouterPool(): void {
+  openrouterPool = new OpenRouterKeyPool(config.openrouterKeys);
+}
 
 export interface LlmResolution {
   ok: boolean;

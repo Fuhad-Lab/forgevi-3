@@ -247,3 +247,10 @@ export function loadConfig(): EngineConfig {
 }
 
 export const config = loadConfig();
+
+/** Hot-apply pushed config: mutate the live config object in place (env
+ *  vars still win — loadConfig re-reads process.env, which the push only
+ *  fills for unset keys). The pool singletons rebuild off this. */
+export function reloadEngineConfig(): void {
+  Object.assign(config, loadConfig());
+}
