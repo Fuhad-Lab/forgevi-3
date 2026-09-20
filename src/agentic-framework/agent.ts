@@ -78,9 +78,13 @@ function observationForError(err: unknown): string {
   return `error: tool execution failed — ${String(err)}`;
 }
 
-/** One final-text answer without any tool call — the model decided. */
-function finalAnswerFromContent(content: string): { summary: string; issues: string[] } {
-  const text = content.trim() || "(the model returned no final text)";
+/** One final-text answer without any tool call — the model decided.
+ *  Reasoning models (nemotron & co.) often put the whole answer in the
+ *  `reasoning` field with an empty `content` — the reasoning IS the answer
+ *  then. */
+function finalAnswerFromContent(content: string, reasoning?: string): { summary: string; issues: string[] } {
+  const text = content.trim() || reasoning?.trim() || "";
+  if (!text) return { summary: "", issues: [] };
   return { summary: text.slice(0, 20_000), issues: [] };
 }
 
@@ -88,6 +92,7 @@ export async function runAgentLoop(opts: AgentLoopOpts): Promise<AgentLoopResult
   const { provider, tools, messages, ctx, emit, signal, ceilings, startedAt, runId } = opts;
   const usage = { promptTokens: 0, completionTokens: 0 };
   let steps = 0;
+  let emptyTurnNudged = false;
 
   const final = (status: "complete" | "incomplete", summary: string, issues: string[], stopReason: AgentLoopResult["stopReason"]): AgentLoopResult => ({
     status,
@@ -167,10 +172,35 @@ export async function runAgentLoop(opts: AgentLoopOpts): Promise<AgentLoopResult
     }
 
     // ── no tool call: the model's answer IS the final answer ──
+    // (A FULLY empty turn — no content, no reasoning, no tool calls — is a
+    // transient free-model glitch: nudge ONCE with an explicit continue
+    // observation before accepting it. An empty answer twice settles
+    // honestly as an empty final answer.)
     if (res.toolCalls.length === 0) {
-      const { summary, issues } = finalAnswerFromContent(res.content);
+      const hasText = Boolean(res.content?.trim() || res.reasoning?.trim());
+      if (!hasText && !emptyTurnNudged) {
+        emptyTurnNudged = true;
+        messages.push({ role: "assistant", content: "" });
+        messages.push({
+          role: "user",
+          content:
+            "(system nudge: your last response was empty — no text and no tool calls. " +
+            "Continue the task: either use a tool or give your final answer.)",
+        });
+        continue;
+      }
+      const { summary, issues } = finalAnswerFromContent(res.content ?? "", res.reasoning);
+      if (!summary) {
+        return final(
+          "incomplete",
+          "The model returned an empty final answer — the run ended without a summary. Work done so far is saved in the workspace.",
+          ["empty final answer"],
+          "final-answer",
+        );
+      }
       return final("complete", summary, issues, "final-answer");
     }
+    emptyTurnNudged = false;
 
     // ── tool calls: act, observe, continue ──
     messages.push({ role: "assistant", content: res.content ?? "", toolCalls: res.toolCalls });
