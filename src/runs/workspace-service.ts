@@ -1,5 +1,5 @@
 /**
- * Forgevi 3.0 — the project workspace service (the studio surface).
+ * Forgevi — the project workspace service (the studio surface).
  *
  * The studio's Files tab, Terminal and Preview operate on the PROJECT's
  * workspace — not on a run. A run is transient; the workspace persists:
@@ -7,7 +7,14 @@
  *     boots (the run's workspaceKey IS the projectId), so studio reads
  *     see exactly what the agent wrote, live and after the run.
  *   - E2B: a lazily-created project sandbox restored from the persisted
- *     snapshot, evicted (persist + destroy) after an idle TTL.
+ *     snapshot, evicted (persist + destroy) after the idle TTL.
+ *
+ * THE LIFECYCLE LAWS (ported from e2b_backblaze/pool/runtime.py):
+ *   - 5-minute idle reaper → persist workspace → destroy VM → seat freed
+ *   - DATA-SAFETY LAW: a failed B2 upload keeps the VM alive — never
+ *     destroy work you haven't saved (the eviction retries next touch)
+ *   - 55-minute seamless migration → fresh VM, in-place handle swap
+ *   - 1-hour hard cap → persist + destroy + evict (rehydrated on demand)
  *
  * These routes are guarded by the relay key (the edge relay verifies
  * project ownership BEFORE dialing; the engine trusts the relay). The
@@ -41,12 +48,28 @@ interface ProjectEntry {
   sandbox: SandboxAdapter;
   lastUsedAt: number;
   evictTimer: NodeJS.Timeout | null;
+  migrateTimer: NodeJS.Timeout | null;
+  hardCapTimer: NodeJS.Timeout | null;
+  /** In-flight eviction/migration guard — one lifecycle op at a time. */
+  busy: boolean;
 }
 
 const projects = new Map<string, ProjectEntry>();
 
-/** How long an idle E2B project sandbox lives before persist + destroy. */
-const E2B_IDLE_TTL_MS = 10 * 60_000;
+function clearLifecycleTimers(entry: ProjectEntry): void {
+  if (entry.evictTimer) {
+    clearTimeout(entry.evictTimer);
+    entry.evictTimer = null;
+  }
+  if (entry.migrateTimer) {
+    clearTimeout(entry.migrateTimer);
+    entry.migrateTimer = null;
+  }
+  if (entry.hardCapTimer) {
+    clearTimeout(entry.hardCapTimer);
+    entry.hardCapTimer = null;
+  }
+}
 
 function touch(entry: ProjectEntry): void {
   entry.lastUsedAt = Date.now();
@@ -55,23 +78,77 @@ function touch(entry: ProjectEntry): void {
     entry.evictTimer = null;
   }
   if (entry.sandbox.kind === "e2b") {
-    entry.evictTimer = setTimeout(() => void evict(entry.sandbox.id), E2B_IDLE_TTL_MS + 1_000);
+    // THE 5-MINUTE IDLE REAPER (+1s grace so the timer never races the TTL)
+    entry.evictTimer = setTimeout(() => void evict(entry.sandbox.id), config.e2bIdleTtlMs + 1_000);
     entry.evictTimer.unref?.();
   }
 }
 
+/** THE 5-MINUTE IDLE REAPER — persist → destroy → seat freed. */
 async function evict(sandboxId: string): Promise<void> {
   for (const [pid, entry] of projects) {
     if (entry.sandbox.id !== sandboxId) continue;
-    projects.delete(pid);
+    if (entry.busy) {
+      // a migration is in flight — re-arm the reaper for after it
+      entry.evictTimer = setTimeout(() => void evict(sandboxId), 30_000);
+      entry.evictTimer.unref?.();
+      return;
+    }
+    entry.busy = true;
+    clearLifecycleTimers(entry);
     try {
       await persistWorkspace({ sandbox: entry.sandbox, storage: createStorage(), workspaceKey: pid });
-    } catch {
-      /* honest best effort — the snapshot retry on next boot */
-    } finally {
-      await entry.sandbox.destroy().catch(() => undefined);
+    } catch (err) {
+      // THE DATA-SAFETY LAW: a failed B2 upload keeps the VM alive —
+      // never destroy work you haven't saved. Retry at the next touch.
+      console.error(
+        `[reaper ${pid}] persist failed — the sandbox stays ALIVE (data-safety law): ${err instanceof Error ? err.message.slice(0, 300) : String(err)}`,
+      );
+      entry.busy = false;
+      touch(entry);
+      return;
     }
+    projects.delete(pid);
+    await entry.sandbox.destroy().catch(() => undefined);
+    entry.busy = false;
     return;
+  }
+}
+
+/** Arm the age-based lifecycle clocks on a fresh E2B entry. */
+function armLifecycle(pid: string, entry: ProjectEntry): void {
+  if (entry.sandbox.kind !== "e2b") return;
+  // THE 55-MINUTE SEAMLESS MIGRATION — a fresh VM takes over before the
+  // hard cap; the handle swaps in place, the viewer never notices.
+  const migrateIn = Math.max(60_000, config.e2bMigrateAtMs - entry.sandbox.ageMs());
+  entry.migrateTimer = setTimeout(() => void migrate(pid), migrateIn);
+  entry.migrateTimer.unref?.();
+  // THE 1-HOUR HARD CAP — persist + destroy + evict (rehydrated on demand).
+  const hardCapIn = Math.max(90_000, config.e2bHardCapMs - entry.sandbox.ageMs());
+  entry.hardCapTimer = setTimeout(() => void evict(entry.sandbox.id), hardCapIn);
+  entry.hardCapTimer.unref?.();
+}
+
+/** The 55-minute migration — swap the entry's sandbox onto a fresh VM. */
+async function migrate(pid: string): Promise<void> {
+  const entry = projects.get(pid);
+  if (!entry || entry.busy) return;
+  entry.busy = true;
+  entry.migrateTimer = null;
+  try {
+    await entry.sandbox.migrate();
+    console.error(`[migrate ${pid}] sandbox swapped onto a fresh microVM (seamless — age reset)`);
+    // re-arm the clocks against the fresh sandbox
+    armLifecycle(pid, entry);
+    entry.busy = false;
+  } catch (err) {
+    console.error(
+      `[migrate ${pid}] failed — keeping the current sandbox, hard cap still armed: ${err instanceof Error ? err.message.slice(0, 300) : String(err)}`,
+    );
+    entry.busy = false;
+    // retry the migration once after 2 minutes; the hard cap still guards
+    entry.migrateTimer = setTimeout(() => void migrate(pid), 2 * 60_000);
+    entry.migrateTimer.unref?.();
   }
 }
 
@@ -95,10 +172,31 @@ export async function getProjectSandbox(projectId: string): Promise<SandboxAdapt
       await sandbox.restoreSnapshot(tar).catch(() => undefined);
     }
   }
-  const entry: ProjectEntry = { sandbox, lastUsedAt: Date.now(), evictTimer: null };
+  const entry: ProjectEntry = {
+    sandbox,
+    lastUsedAt: Date.now(),
+    evictTimer: null,
+    migrateTimer: null,
+    hardCapTimer: null,
+    busy: false,
+  };
   projects.set(projectId, entry);
   touch(entry);
+  armLifecycle(projectId, entry);
   return sandbox;
+}
+
+/** The live registry (the /e2b/pool dashboard's session list). */
+export function projectSessions(): Array<{ projectId: string; kind: "e2b" | "local"; sandboxId: string; lastUsedAt: number; ageMs: number; idleForMs: number }> {
+  const now = Date.now();
+  return [...projects.entries()].map(([projectId, entry]) => ({
+    projectId,
+    kind: entry.sandbox.kind,
+    sandboxId: entry.sandbox.id,
+    lastUsedAt: entry.lastUsedAt,
+    ageMs: entry.sandbox.ageMs(),
+    idleForMs: now - entry.lastUsedAt,
+  }));
 }
 
 // ── studio operations ──────────────────────────────────────────────────
@@ -218,10 +316,10 @@ export interface WorkspaceSeatStatus {
 export async function projectStatus(projectId: string, liveDevPort: number | null): Promise<WorkspaceSeatStatus> {
   const entry = projects.get(projectId);
   return {
-    driver: config.e2bKey ? "e2b" : "local",
+    driver: config.e2bKeys.length > 0 ? "e2b" : "local",
     configured: true,
     session: entry
-      ? { id: entry.sandbox.id, kind: entry.sandbox.kind, lastUsedAt: entry.lastUsedAt }
+      ? { id: entry.sandbox.id, kind: entry.sandbox.kind, lastUsedAt: entry.lastUsedAt, ageMs: entry.sandbox.ageMs() }
       : null,
     previewPort: liveDevPort,
   };

@@ -6,3 +6,7 @@ engine.log
 mcp_servers.json
 *.log
 .DS_Store
+
+# runtime secrets — never committed
+.engine-test.env
+.engine-runtime-config.json

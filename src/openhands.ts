@@ -11,6 +11,8 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { config } from "./config.ts";
+import { OpenRouterKeyPool, isOpenRouterQuotaSignature, type KeyPick } from "./llm/openrouter-pool.ts";
 
 export interface LlmConfig {
   model: string;
@@ -18,46 +20,89 @@ export interface LlmConfig {
   baseUrl?: string;
 }
 
+/** THE OPENROUTER POOL (module singleton — round-robin + 429/quota latching). */
+export const openrouterPool = new OpenRouterKeyPool(config.openrouterKeys);
+
 export interface LlmResolution {
   ok: boolean;
   error?: string;
   llm?: LlmConfig;
-  /** The NVIDIA NIM lane (NVIDIA_API_KEY) — used when the OpenRouter
-   *  free tier's account-wide daily budget is exhausted. */
+  /** The pool pick this resolution rode — the manager reports outcomes to it. */
+  pick?: KeyPick;
+  /** The full free-model chain (the manager's lane fallback order). */
+  modelChain: string[];
+  /** The NVIDIA NIM lane (NVIDIA_API_KEY) — the last-resort failover. */
   nvidia?: LlmConfig;
+  /** Pool telemetry for /health + /stats. */
+  pool: ReturnType<OpenRouterKeyPool["stats"]>;
 }
 
-/** The engine's LLM lanes: one env-driven OpenAI-compatible gateway,
- *  plus the NVIDIA NIM failover lane when its key is configured. */
+/** The engine's LLM lanes: the OpenRouter KEY POOL (round-robin, cascade on
+ *  429/quota) + the model CHAIN (ENGINE_MODELS, comma-separated, first
+ *  healthy wins) + the NVIDIA NIM failover lane when configured. */
 export function resolveLlmConfig(): LlmResolution {
-  const env = process.env;
-  const apiKey = env.OPENROUTER_API_KEY || undefined;
-  const rawModel = env.ENGINE_MODEL || "nvidia/nemotron-3-super-120b-a12b:free";
-  if (!apiKey) {
-    return { ok: false, error: "OPENROUTER_API_KEY is not set — the engine has no LLM" };
+  if (config.openrouterKeys.length === 0) {
+    return {
+      ok: false,
+      error: "OPENROUTER_API_KEYS is not set — the engine has no LLM",
+      modelChain: config.modelChain,
+      pool: openrouterPool.stats(),
+    };
   }
-  const bare = rawModel.replace(/^openai\//, "");
-  const model = `openai/${bare}`; // litellm gateway form: openai/<model> + base_url
-  const nvidiaKey = env.NVIDIA_API_KEY || env.NVIDIA_NIM_API_KEY || undefined;
-  const nvidiaBare = (env.NVIDIA_MODEL || "nvidia/nemotron-3.5-lightning-30b-a3b").replace(/^openai\//, "");
+  let pick: KeyPick;
+  try {
+    pick = openrouterPool.pick();
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      modelChain: config.modelChain,
+      pool: openrouterPool.stats(),
+    };
+  }
+  const model = `openai/${config.modelChain[0] ?? "nvidia/nemotron-3-ultra-550b-a55b:free"}`;
+  const nvidiaKey = process.env.NVIDIA_API_KEY || process.env.NVIDIA_NIM_API_KEY || undefined;
+  const nvidiaBare = (process.env.NVIDIA_MODEL || "nvidia/nemotron-3.5-lightning-30b-a3b").replace(/^openai\//, "");
   return {
     ok: true,
     llm: {
       model,
-      apiKey,
-      baseUrl: env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
+      apiKey: pick.apiKey,
+      baseUrl: config.openrouterBaseUrl,
     },
+    pick,
+    modelChain: config.modelChain,
     ...(nvidiaKey
       ? {
           nvidia: {
             model: `openai/${nvidiaBare}`,
             apiKey: nvidiaKey,
-            baseUrl: env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1",
+            baseUrl: process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1",
           },
         }
       : {}),
+    pool: openrouterPool.stats(),
   };
 }
+
+/** Resolve a SPECIFIC lane (the manager's rotation): a given model index
+ *  through a FRESH pool pick. Returns null when the pool is exhausted. */
+export function resolveLaneLlm(modelIndex: number): { llm: LlmConfig; pick: KeyPick } | null {
+  if (config.openrouterKeys.length === 0) return null;
+  const bare = config.modelChain[modelIndex % Math.max(1, config.modelChain.length)];
+  if (!bare) return null;
+  try {
+    const pick = openrouterPool.pick();
+    return {
+      llm: { model: `openai/${bare}`, apiKey: pick.apiKey, baseUrl: config.openrouterBaseUrl },
+      pick,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export { isOpenRouterQuotaSignature };
 
 export type OpenHandsEvent =
   | { type: "thinking"; text: string }

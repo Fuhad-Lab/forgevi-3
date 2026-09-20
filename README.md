@@ -121,3 +121,55 @@ Set `WORKSPACE_GRANT_SECRET` (same as the backend), `OPENROUTER_API_KEY`,
 `ENGINE_RELAY_KEY`, `E2B_API_KEY`, `B2_*`. Wire the frontend's
 `engine-ops` relay to this service's URL via the
 `ARCFORGE_FORGVI3_ENGINE_URL` edge secret.
+
+---
+
+# 3.2.0 — the pool laws (E2B + B2 + OpenRouter + Redis)
+
+**The compute substrate, per the platform's own e2b_backblaze laws:**
+
+- **THE E2B KEY POOL** (`src/e2b-backblaze/pool/broker.ts`): 20 seats/key,
+  ≥1000ms spawn throttle per key, least-loaded cascade, bounded spawn
+  queue, 429 telemetry + cooldown, rollback on failed acquisition,
+  provider-truth reconcile (`POST /e2b/pool/reconcile`), honest
+  `PoolExhaustedError` ("0/0 slots across 0 keys" — never fake execution).
+  Keys: `E2B_API_KEYS` (csv) or `E2B_API_KEY_1..N` or legacy `E2B_API_KEY`.
+- **THE B2 SELF-HEALING BOOTSTRAP** (`src/e2b-backblaze/b2.ts`): give it
+  the master `B2_KEY_ID`/`B2_APPLICATION_KEY` — it auto-discovers the S3
+  endpoint/region via `b2_authorize`, mints a dedicated S3-credential key
+  cached at `~/.agent-platform/b2-s3-key.json`, and auto-creates the
+  private bucket when none exists. Production bucket: `Forgeyn`
+  (`s3.eu-central-003`). Direct S3 creds (`B2_S3_KEY_ID`/
+  `B2_S3_APPLICATION_KEY`) skip the bootstrap.
+- **THE SANDBOX LIFECYCLE** (`src/runs/workspace-service.ts`): 5-minute
+  idle reaper → persist to B2 → destroy VM → seat freed (DATA-SAFETY LAW:
+  a failed B2 upload keeps the VM alive — never destroy unsaved work);
+  55-minute seamless migration (fresh VM, in-place handle swap);
+  1-hour hard cap (persist + evict + rehydrate on demand).
+- **THE OPENROUTER KEY POOL** (`src/llm/openrouter-pool.ts`): round-robin
+  across keys with 429/quota latching (60s / 6h cooldowns), per-key
+  telemetry, plus THE MODEL CHAIN (`ENGINE_MODELS`, csv) — when a lane
+  dies with the quota signature the run rotates to the next pooled key +
+  next model, announced in the stream. NVIDIA NIM remains the final lane.
+  Keys: `OPENROUTER_API_KEYS` (csv) or `OPENROUTER_API_KEY_1..N` or
+  legacy `OPENROUTER_API_KEY`.
+- **THE MESSAGE-CACHING LAW** (`src/redis.ts`): no localStorage anywhere
+  in the AI system — chat history per project + journal frames per run
+  live in Upstash Redis (`UPSTASH_REDIS_REST_URL` +
+  `UPSTASH_REDIS_REST_TOKEN`, REST API, best-effort by design). THE
+  CONTINUITY MERGE: a run arriving with missing chatHistory still
+  continues the SAME conversation from the Redis cache — the fix for
+  "every message treated as a new project" after engine restarts.
+
+**The deploy path (no Render dashboard needed):** `POST /admin/config`
+(relay-key guarded, edge master-email gated) writes
+`.engine-runtime-config.json` — env vars always WIN, the runtime file
+fills gaps. The edge function pushes pool keys + service credentials
+through it at deploy time.
+
+**Env knobs (all optional, honest defaults):** `E2B_SEATS_PER_KEY=20`,
+`E2B_SPAWN_THROTTLE_MS=1000`, `E2B_SPAWN_QUEUE_MAX=8`, `E2B_IDLE_TTL_MS=300000`,
+`E2B_MIGRATE_AT_MS=3300000`, `E2B_HARD_CAP_MS=3600000`,
+`E2B_POOL__API_TOKEN`, `E2B_TEMPLATE_ID`, `B2_BUCKET=Forgeyn`, `B2_REGION`
+(auto-discovered when unset), `ENGINE_MODELS` (default free chain:
+`nvidia/nemotron-3-ultra-550b-a55b:free,nvidia/nemotron-3.5-lightning:free,nvidia/nemotron-3-super-120b-a12b:free`).

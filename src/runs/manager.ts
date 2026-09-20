@@ -14,11 +14,26 @@ import { verifyWorkspaceGrant } from "../grant.ts";
 import { createSandbox, type SandboxAdapter } from "../e2b-backblaze/sandbox.ts";
 import { createStorage } from "../e2b-backblaze/storage.ts";
 import { bootWorkspace, persistWorkspace } from "../e2b-backblaze/template.ts";
-import { resolveLlmConfig, runOpenHands, type LlmConfig, type OpenHandsEvent } from "../openhands.ts";
+import {
+  resolveLlmConfig,
+  resolveLaneLlm,
+  runOpenHands,
+  isOpenRouterQuotaSignature,
+  type LlmConfig,
+  type OpenHandsEvent,
+} from "../openhands.ts";
 import { buildTaskPrompt, type ChatHistoryRow } from "../task.ts";
 import { normalizeUploads, type RawUpload } from "../uploads/uploads.ts";
 import { RunJournal, type JournalEvent } from "./journal.ts";
 import { counters, initTelemetry } from "../tools/monitoring/telemetry.ts";
+import {
+  appendProjectTurn,
+  cacheProjectChat,
+  cacheRunEvent,
+  loadProjectChat,
+  mergeChatHistories,
+  redisConfigured,
+} from "../redis.ts";
 
 export interface StartRunInput {
   objective: string;
@@ -171,7 +186,10 @@ export function startRun(input: StartRunInput): { status: number; body: Record<s
   const runId = randomUUID();
   const goalId = randomUUID();
   const sessionId = `s-${randomUUID().slice(0, 8)}`;
-  const journal = new RunJournal(runId, sessionId, goalId);
+  // THE REDIS JOURNAL CACHE (best-effort frame sink — restart resilience)
+  const journal = new RunJournal(runId, sessionId, goalId, (frame) => {
+    if (redisConfigured()) void cacheRunEvent(runId, frame.seq, frame);
+  });
 
   const run: RunState = {
     view: {
@@ -325,6 +343,20 @@ async function executeRun(
       throw new Error(llmResult.error || "the engine has no LLM configured");
     }
 
+    // THE CONTINUITY LAW (the fix for "every message = a new project"):
+    // the frontend-supplied chat history rides every run — and the Redis
+    // cache fills any gap (engine restart, lost cookie, new device), so
+    // the conversation CONTINUES instead of starting fresh. The merged
+    // history is cached back (best-effort) for the next run.
+    let chatHistory: ChatHistoryRow[] = Array.isArray(input.chatHistory) ? input.chatHistory : [];
+    if (workspaceKey) {
+      const cached = await loadProjectChat(workspaceKey);
+      chatHistory = mergeChatHistories(chatHistory, cached);
+      if (chatHistory.length > 0) {
+        void cacheProjectChat(workspaceKey, chatHistory.map((m) => ({ role: m.role, content: m.content, at: Date.now() })));
+      }
+    }
+
     const prompt = buildTaskPrompt(
       {
         objective: view.objective,
@@ -334,7 +366,7 @@ async function executeRun(
         devPort: run.devPort,
         uploads: uploadManifest,
       },
-      Array.isArray(input.chatHistory) ? input.chatHistory : [],
+      chatHistory,
     );
 
     // THE mandate: ONE real OpenHands agent, one conversation, one workspace.
@@ -370,26 +402,53 @@ async function executeRun(
     };
 
     outcome = await runLane(llmResult.llm);
+    llmResult.pick?.reportSuccess();
 
-    // The OpenRouter free tier is account-wide (50 req/day): when it is
-    // exhausted every model 429s with the same signature — the run dies.
-    // If the NVIDIA NIM lane is configured, ONE honest lane switch keeps
-    // the platform building. Announced in the stream, never silent.
-    const exhausted =
-      outcome &&
-      !abort.signal.aborted &&
-      llmResult.nvidia &&
-      /free-models-per-day|free_tier_daily|add 10 credits/i.test(
-        `${outcome.summary} ${outcome.remainingIssues.join(" ")}`,
-      );
-    if (exhausted && outcome && llmResult.nvidia) {
-      emit({
-        type: "tool_used",
-        tool: "engine",
-        status: "ok",
-        detail: "OpenRouter free tier exhausted — switching this run to the NVIDIA lane",
-      });
-      outcome = await runLane(llmResult.nvidia);
+    // THE KEY-POOL CASCADE: when the lane died with the quota/429 signature
+    // (a key's free tier is exhausted), rotate to the NEXT pooled key +
+    // next model in the chain — announced in the stream, never silent.
+    // The NVIDIA NIM lane remains the final failover when configured.
+    if (outcome && !abort.signal.aborted) {
+      const signature = `${outcome.summary} ${outcome.remainingIssues.join(" ")}`;
+      let quotaHit = outcome.status === "incomplete" && isOpenRouterQuotaSignature(signature);
+      let laneIdx = 1;
+      while (
+        quotaHit &&
+        !abort.signal.aborted &&
+        laneIdx < Math.max(1, llmResult.modelChain.length)
+      ) {
+        const lane = resolveLaneLlm(laneIdx);
+        if (!lane) break; // the pool is exhausted — fall through to NIM
+        emit({
+          type: "tool_used",
+          tool: "engine",
+          status: "ok",
+          detail: `OpenRouter lane exhausted (${llmResult.modelChain[laneIdx - 1] ?? "primary"}) — rotating to the next pooled key + model: ${llmResult.modelChain[laneIdx]}`,
+        });
+        outcome = await runLane(lane.llm);
+        lane.pick.reportSuccess();
+        laneIdx += 1;
+        quotaHit =
+          outcome !== null &&
+          outcome.status === "incomplete" &&
+          isOpenRouterQuotaSignature(`${outcome.summary} ${outcome.remainingIssues.join(" ")}`);
+      }
+      // the final failover lane (NVIDIA NIM) when the whole pool is dry
+      const nvidiaExhausted =
+        outcome &&
+        !abort.signal.aborted &&
+        llmResult.nvidia &&
+        outcome.status === "incomplete" &&
+        isOpenRouterQuotaSignature(`${outcome.summary} ${outcome.remainingIssues.join(" ")}`);
+      if (nvidiaExhausted && outcome && llmResult.nvidia) {
+        emit({
+          type: "tool_used",
+          tool: "engine",
+          status: "ok",
+          detail: "OpenRouter pool exhausted — switching this run to the NVIDIA lane",
+        });
+        outcome = await runLane(llmResult.nvidia);
+      }
     }
   } catch (err) {
     hardError = err instanceof Error ? err.message : String(err);
@@ -451,5 +510,14 @@ async function executeRun(
       remainingIssues: ["engine error: no outcome"],
     });
   }
+  // THE MESSAGE-CACHING LAW: the completed turn lands in the Redis cache
+  // (best-effort) — the next run's continuity merge reads it back.
+  if (workspaceKey && !abort.signal.aborted) {
+    const assistantSummary =
+      view.report?.summary ??
+      (hardError ? `The run failed: ${hardError}` : "(no summary provided)");
+    void appendProjectTurn(workspaceKey, { user: view.objective, assistant: assistantSummary.slice(0, 20_000) });
+  }
+
   journal.close();
 }

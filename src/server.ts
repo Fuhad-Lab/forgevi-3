@@ -6,15 +6,28 @@
  * GET  /runs/:id            run state
  * GET  /runs/:id/events?since=N   SSE — replay, live frames, 15s pings, forge-close
  * POST /runs/:id/abort      {reason?}
- * GET  /stats               engine stats (runs, active, model)
+ * GET  /stats               engine stats (runs, active, model, pools)
+ *
+ * THE E2B POOL SURFACE (the pool laws):
+ * GET  /e2b/pool            dashboard — seats, throttle, 429s, sessions
+ *                           (guarded by E2B_POOL__API_TOKEN)
+ * POST /e2b/pool/reconcile  provider-truth reconciliation — probes E2B with
+ *                           the sandbox list per key and re-adopts live seats
+ *                           (guarded by E2B_POOL__API_TOKEN)
+ *
+ * THE CONFIG-PUSH SURFACE (the deploy path — no Render dashboard needed):
+ * POST /admin/config        {values: {KEY: value}} — relay-key guarded; the
+ *                           edge function (master-email gated) pushes pool
+ *                           keys and service credentials; env vars always
+ *                           win, the runtime file fills gaps
  *
  * CORS allowlist per the contract; OPTIONS handled. No framework — one
  * Bun.serve, one process, no message bus behind it.
  */
 
-import { config } from "./config.ts";
+import { config, writeRuntimeConfigFile, runtimeConfigPath } from "./config.ts";
 import { abortRun, activeRunCount, getLlmConfig, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, findLiveRunForProject, liveRunDevPort, type StartRunInput } from "./runs/manager.ts";
-import { probeOpenHands, probeOpenHandsSync } from "./openhands.ts";
+import { probeOpenHands, probeOpenHandsSync, openrouterPool } from "./openhands.ts";
 import {
   projectFiles,
   projectReadFile,
@@ -25,12 +38,17 @@ import {
   projectUploadsManifest,
   projectStatus,
   projectHeartbeat,
+  projectSessions,
   validProjectId,
   studioSafePath,
 } from "./runs/workspace-service.ts";
+import { e2bBroker } from "./e2b-backblaze/sandbox.ts";
+import { b2BootstrapStatus } from "./e2b-backblaze/b2.ts";
+import { redisConfigured } from "./redis.ts";
+import { loadRunEvents } from "./redis.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
 
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 const KERNEL = "openhands-sdk";
 
 const ALLOWED_ORIGINS = new Set([
@@ -133,11 +151,74 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown> |
 
 // Warm the OpenHands capability probe once at boot so /health is fast.
 void probeOpenHands().catch(() => undefined);
+// Warm the B2 self-healing bootstrap once at boot (minted-key latency).
+void b2BootstrapStatus().catch(() => undefined);
 
 function providerLabel(): string {
   const llm = getLlmConfig();
   if (!llm.ok || !llm.llm) return "unconfigured";
   return llm.llm.model.replace(/^openai\//, "");
+}
+
+/** THE E2B POOL DASHBOARD SHAPE (seats, throttle, 429s, sessions). */
+async function poolDashboard(): Promise<Record<string, unknown>> {
+  return {
+    broker: e2bBroker.stats(),
+    b2: await b2BootstrapStatus(),
+    redis: {
+      configured: redisConfigured(),
+      ...(config.redis ? { endpoint: config.redis.restUrl.replace(/^https:\/\//, "") } : {}),
+    },
+    lifecycle: {
+      idleTtlMs: config.e2bIdleTtlMs,
+      migrateAtMs: config.e2bMigrateAtMs,
+      hardCapMs: config.e2bHardCapMs,
+      seatsPerKey: config.e2bSeatsPerKey,
+      spawnThrottleMs: config.e2bSpawnThrottleMs,
+    },
+    sessions: projectSessions(),
+  };
+}
+
+/** PROVIDER-TRUTH RECONCILIATION — probe E2B with the sandbox list per
+ *  key, re-adopt live seats (free-tier sleep / redeploy / crash drift). */
+async function reconcilePool(): Promise<Record<string, unknown>> {
+  if (config.e2bKeys.length === 0) {
+    return { ok: false, error: "E2B pool has 0 keys — nothing to reconcile" };
+  }
+  const { Sandbox } = (await import("e2b")) as {
+    Sandbox: { list: (opts?: Record<string, unknown>) => { nextItems: () => Promise<Array<{ sandboxId?: string }>>; hasNext: boolean } };
+  };
+  const liveCounts: Array<{ keyLabel: string; live: number; sandboxIds: string[]; error?: string }> = [];
+  const stats = e2bBroker.stats();
+  for (const keyStat of stats.keyStats) {
+    const key = config.e2bKeys[stats.keyStats.indexOf(keyStat)];
+    if (!key) continue;
+    try {
+      const paginator = Sandbox.list({ apiKey: key });
+      const ids: string[] = [];
+      while (paginator.hasNext) {
+        const items = await paginator.nextItems();
+        for (const item of items) {
+          if (typeof item.sandboxId === "string") ids.push(item.sandboxId);
+        }
+      }
+      liveCounts.push({ keyLabel: keyStat.label, live: ids.length, sandboxIds: ids });
+    } catch (err) {
+      liveCounts.push({
+        keyLabel: keyStat.label,
+        live: -1,
+        sandboxIds: [],
+        error: err instanceof Error ? err.message.slice(0, 200) : String(err),
+      });
+    }
+  }
+  e2bBroker.seedSlots(liveCounts.map((c) => ({ keyLabel: c.keyLabel, live: Math.max(0, c.live) })));
+  return {
+    ok: true,
+    reconciled: liveCounts.map((c) => ({ key: c.keyLabel, live: c.live })),
+    broker: e2bBroker.stats(),
+  };
 }
 
 const server = Bun.serve({
@@ -171,8 +252,11 @@ const server = Bun.serve({
           agent: probe
             ? { ok: probe.ok, sdk: probe.sdk, tools: probe.tools, error: probe.error }
             : { ok: false, error: "probing" },
-          sandbox: config.e2bKey ? "e2b" : "local",
+          sandbox: config.e2bKeys.length > 0 ? "e2b-pool" : "local",
           storage: config.b2 ? "backblaze-b2" : "local-disk",
+          redis: redisConfigured() ? "upstash" : "none",
+          e2bPool: e2bBroker.stats(),
+          openrouterPool: openrouterPool.stats(),
           activeRuns: activeRunCount(),
           totalRuns: totalRunCount(),
         },
@@ -191,11 +275,67 @@ const server = Bun.serve({
           kernel: KERNEL,
           model: providerLabel(),
           agent: probe ? { ok: probe.ok, sdk: probe.sdk, tools: probe.tools } : { ok: false, error: "probing" },
-          sandbox: config.e2bKey ? "e2b" : "local",
+          sandbox: config.e2bKeys.length > 0 ? "e2b-pool" : "local",
           storage: config.b2 ? "backblaze-b2" : "local-disk",
+          redis: redisConfigured() ? "upstash" : "none",
+          e2bPool: e2bBroker.stats(),
+          openrouterPool: openrouterPool.stats(),
           activeRuns: activeRunCount(),
           totalRuns: totalRunCount(),
           ceilings: { steps: config.maxSteps, wallclockMs: config.maxWallclockMs, tokens: config.maxTokens },
+        },
+        200,
+        origin,
+      );
+    }
+
+    // ── THE E2B POOL DASHBOARD (E2B_POOL__API_TOKEN guarded) ──────────
+    if ((path === "/e2b/pool" && request.method === "GET") || (path === "/e2b/pool/reconcile" && request.method === "POST")) {
+      // live-read: the config-push surface may have updated it in-process
+      const poolToken = process.env.E2B_POOL__API_TOKEN || config.e2bPoolToken;
+      if (!poolToken) {
+        return json({ error: "pool surface not configured (E2B_POOL__API_TOKEN unset)" }, 503, origin);
+      }
+      const token = request.headers.get("X-Pool-Token") ?? request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "") ?? "";
+      if (token !== poolToken) {
+        return json({ error: "forbidden — pool token required" }, 403, origin);
+      }
+      if (path === "/e2b/pool") {
+        return json(await poolDashboard(), 200, origin);
+      }
+      return json(await reconcilePool(), 200, origin);
+    }
+
+    // ── THE CONFIG-PUSH SURFACE (relay-key guarded deploy path) ──────
+    if (path === "/admin/config" && request.method === "POST") {
+      if (!config.relayKey) {
+        return json({ error: "config surface not configured (ENGINE_RELAY_KEY unset)" }, 503, origin);
+      }
+      const key = request.headers.get("X-Engine-Relay-Key") ?? "";
+      if (key !== config.relayKey) {
+        return json({ error: "forbidden — relay key required" }, 403, origin);
+      }
+      const body = await readJsonBody(request);
+      const values = body?.["values"];
+      if (!values || typeof values !== "object" || Array.isArray(values)) {
+        return json({ error: "values (object of KEY: string) is required" }, 400, origin);
+      }
+      const clean: Record<string, string> = {};
+      for (const [k, v] of Object.entries(values as Record<string, unknown>)) {
+        if (typeof k !== "string" || typeof v !== "string" || k.length > 64 || v.length > 32_768) continue;
+        clean[k] = v;
+      }
+      if (Object.keys(clean).length === 0) {
+        return json({ error: "no valid values supplied" }, 400, origin);
+      }
+      const { written, denied } = writeRuntimeConfigFile(clean);
+      return json(
+        {
+          ok: true,
+          applied: written,
+          denied,
+          note: "values are in-memory now and persisted to the runtime config file — env vars (when set) still take precedence at boot",
+          runtimeConfigPath: runtimeConfigPath(),
         },
         200,
         origin,
@@ -224,7 +364,32 @@ const server = Bun.serve({
     const runMatch = /^\/runs\/([^/]+)$/.exec(path);
     if (runMatch && request.method === "GET") {
       const view = getRunView(runMatch[1]!);
-      if (!view) return notFound(origin);
+      if (!view) {
+        // THE REDIS REPLAY FALLBACK: the engine lost the run (restart) but
+        // the journal cache may still hold its frames — surface them so the
+        // frontend can settle the stream honestly instead of a bare 404.
+        const cached = await loadRunEvents(runMatch[1]!);
+        if (cached && cached.length > 0) {
+          return json(
+            {
+              runId: runMatch[1],
+              status: "incomplete",
+              objective: "",
+              acceptance: [],
+              iteration: 0,
+              budgets: {},
+              workspace: { bound: false },
+              startedAt: 0,
+              eventCount: cached.length,
+              cachedEvents: true,
+              note: "the engine restarted and lost this run — the Redis journal cache holds its frames",
+            },
+            200,
+            origin,
+          );
+        }
+        return notFound(origin);
+      }
       return json(view, 200, origin);
     }
 
@@ -415,4 +580,6 @@ const server = Bun.serve({
   },
 });
 
-console.error(`[forgevi-3] listening on :${server.port} — kernel=${KERNEL} sandbox=${config.e2bKey ? "e2b" : "local"} storage=${config.b2 ? "backblaze-b2" : "local-disk"}`);
+console.error(
+  `[forgevi-3] listening on :${server.port} — kernel=${KERNEL} sandbox=${config.e2bKeys.length > 0 ? `e2b-pool(${config.e2bKeys.length} keys)` : "local"} storage=${config.b2 ? "backblaze-b2" : "local-disk"} redis=${redisConfigured() ? "upstash" : "none"} openrouter-keys=${config.openrouterKeys.length} version=${VERSION}`,
+);

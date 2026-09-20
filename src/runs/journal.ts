@@ -2,11 +2,11 @@
  * Forgevi 3.0 — the run journal.
  *
  * Every engine action lands here as a seq-numbered frame; SSE readers
- * replay from ?since= and then stream live. In-memory by design — the
- * same trade the 2.0 engine makes (the frontend's poll fallback handles
- * engine restarts honestly; a 404 renders "everything built so far is
- * saved in your workspace"). No Redis, no external bus — a single
- * process owns the journal and fans it out to open streams directly.
+ * replay from ?since= and then stream live. In-memory by design — with
+ * an optional best-effort frame sink (the Upstash Redis journal cache)
+ * so an SSE re-attach after an engine restart replays what Redis still
+ * holds instead of an immediate 404. The journal itself stays single-
+ * process: one owner, direct fan-out, no external bus in the hot path.
  */
 
 export interface JournalEvent {
@@ -26,6 +26,9 @@ export interface JournalEnvelope {
   event: JournalEvent;
 }
 
+/** Async frame sink (best-effort) — the Redis journal cache rides this. */
+export type FrameSink = (frame: JournalEnvelope) => void;
+
 export type FrameListener = (frame: JournalEnvelope) => void;
 
 export class RunJournal {
@@ -39,6 +42,7 @@ export class RunJournal {
     private readonly runId: string,
     private readonly sessionId: string,
     private readonly goalId: string,
+    private readonly onFrame?: FrameSink,
   ) {}
 
   /** Append an event; assigns seq/id/ts and fans out to live listeners. */
@@ -56,6 +60,13 @@ export class RunJournal {
       event,
     };
     this.frames.push(frame);
+    if (this.onFrame) {
+      try {
+        this.onFrame(frame);
+      } catch {
+        /* the cache sink never breaks the journal */
+      }
+    }
     for (const listener of this.listeners) {
       try {
         listener(frame);
