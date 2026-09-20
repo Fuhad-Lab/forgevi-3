@@ -136,6 +136,11 @@ function providerLabel(): string {
   return config.model ?? "nvidia/nemotron-3-super-120b-a12b:free";
 }
 
+/** True when the NVIDIA NIM fallback lane is configured. */
+function nvidiaFallback(): boolean {
+  return config.provider === "openrouter" && !!config.nvidia?.key;
+}
+
 const server = Bun.serve({
   port: config.port,
   async fetch(request): Promise<Response> {
@@ -166,6 +171,7 @@ const server = Bun.serve({
           version: VERSION,
           kernel: KERNEL,
           model,
+          fallback: nvidiaFallback() ? "nvidia-nim" : undefined,
           sandbox: config.e2bKey ? "e2b" : "local",
           storage: config.b2 ? "backblaze-b2" : "local-disk",
           activeRuns: activeRunCount(),

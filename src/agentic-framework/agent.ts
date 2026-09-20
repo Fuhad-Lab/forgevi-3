@@ -155,6 +155,15 @@ export async function runAgentLoop(opts: AgentLoopOpts): Promise<AgentLoopResult
         return final("incomplete", "Aborted by the user. Work done so far is saved in the workspace.", [], "aborted");
       }
       const message = err instanceof Error ? err.message : String(err);
+      // Free-tier exhaustion gets an actionable summary, not a raw 429 dump.
+      if (/free-models-per-day|free_tier_daily/.test(message)) {
+        return final(
+          "incomplete",
+          "The OpenRouter free tier's daily request budget is used up for today (50 requests/day — the limit is account-wide, so every model fails). It resets at 00:00 UTC. To keep building without this wall, add $10 of credits at https://openrouter.ai/credits (unlocks 1000 free requests/day), or set NVIDIA_API_KEY on the engine as the fallback lane.",
+          ["openrouter-free-tier-exhausted"],
+          "error",
+        );
+      }
       return final("incomplete", `The model provider failed: ${message}`, [message], "error");
     }
 

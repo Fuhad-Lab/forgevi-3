@@ -15,6 +15,11 @@ export interface EngineConfig {
   model: string | undefined;
   openrouterKey: string | undefined;
 
+  /** NVIDIA NIM fallback — the OpenRouter free tier is 50 requests/day
+   *  (account-wide). When the whole openrouter chain 429s with the
+   *  free-models-per-day signature, runs fail over to this lane. */
+  nvidia: { key: string; baseUrl: string; model: string | undefined } | undefined;
+
   mcpServers: McpServerConfig[];
 
   e2bKey: string | undefined;
@@ -95,6 +100,15 @@ export function loadConfig(): EngineConfig {
     provider,
     model: env.ENGINE_MODEL || undefined,
     openrouterKey: env.OPENROUTER_API_KEY || undefined,
+
+    nvidia:
+      env.NVIDIA_API_KEY || env.NVIDIA_NIM_API_KEY
+        ? {
+            key: (env.NVIDIA_API_KEY || env.NVIDIA_NIM_API_KEY)!,
+            baseUrl: env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1",
+            model: env.NVIDIA_MODEL || undefined,
+          }
+        : undefined,
 
     mcpServers: parseMcpServers(env.MCP_SERVERS),
 

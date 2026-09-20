@@ -17,7 +17,8 @@ import { bootWorkspace, persistWorkspace } from "../e2b-backblaze/template.ts";
 import { createZaiProvider } from "../llm/zai.ts";
 import { createMockProvider } from "../llm/mock.ts";
 import { createOpenRouterProvider } from "../llm/openrouter.ts";
-import type { LLMProvider } from "../llm/provider.ts";
+import { createNvidiaProvider } from "../llm/nvidia.ts";
+import type { ChatMessage, ChatResult, LLMProvider, ToolDef } from "../llm/provider.ts";
 import { assembleContext, type ChatHistoryRow } from "../agentic-framework/context.ts";
 import { runAgentLoop, type AgentLoopResult } from "../agentic-framework/agent.ts";
 import { CORE_TOOLS, type AgentTool, type ToolCtx } from "../tools/registry.ts";
@@ -81,12 +82,43 @@ interface RunState {
 
 let providerPromise: Promise<LLMProvider> | null = null;
 
+/** OpenRouter's free tier is account-wide: once the daily request budget
+ *  is gone EVERY model on the chain 429s with the same signature. */
+function isFreeTierExhausted(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /free-models-per-day|free_tier_daily|Rate limit exceeded/i.test(msg);
+}
+
+/** Wrap the openrouter provider with the NVIDIA NIM failover lane. Once a
+ *  free-tier exhaustion is seen, the wrapper latches to NVIDIA for the
+ *  rest of the process's lifetime (the OpenRouter budget will not come
+ *  back until 00:00 UTC — retrying it mid-run just burns steps). */
+function withNvidiaFailover(primary: LLMProvider): LLMProvider {
+  if (!config.nvidia) return primary;
+  let latched: LLMProvider | null = null;
+  return {
+    name: "openrouter+nvidia",
+    model: primary.model,
+    async chat(messages: ChatMessage[], tools: ToolDef[], opts): Promise<ChatResult> {
+      if (latched) return latched.chat(messages, tools, opts);
+      try {
+        return await primary.chat(messages, tools, opts);
+      } catch (err) {
+        if (opts?.signal?.aborted || !isFreeTierExhausted(err)) throw err;
+        console.warn(`[provider] OpenRouter free tier exhausted — failing over to NVIDIA NIM for the rest of this process`);
+        latched = createNvidiaProvider();
+        return latched.chat(messages, tools, opts);
+      }
+    },
+  };
+}
+
 export function getProvider(): Promise<LLMProvider> {
   if (!providerPromise) {
     providerPromise = (async () => {
       if (config.provider === "mock") return createMockProvider();
       if (config.provider === "zai") return await createZaiProvider();
-      return createOpenRouterProvider();
+      return withNvidiaFailover(createOpenRouterProvider());
     })().catch((err) => {
       providerPromise = null; // honest retry on next request
       throw err;
