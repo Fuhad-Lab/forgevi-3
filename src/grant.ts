@@ -28,6 +28,8 @@ function safeEqual(a: string, b: string): boolean {
 export interface GrantClaims {
   projectId: string;
   sandboxId: string;
+  /** "manifest" (3.0 — the engine's persisted workspace) or "sandbox" (2.0-era). */
+  workspace: "manifest" | "sandbox" | null;
   userId: string;
   expiresAt: number;
 }
@@ -51,12 +53,20 @@ export function verifyWorkspaceGrant(
     if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
     const payload: Record<string, unknown> = JSON.parse(Buffer.from(body, "base64url").toString("utf-8"));
     if (payload["v"] !== 1) return null;
-    if (typeof payload["sandboxId"] !== "string" || !payload["sandboxId"]) return null;
     if (typeof payload["projectId"] !== "string" || !payload["projectId"]) return null;
     if (typeof payload["exp"] !== "number" || payload["exp"] + clockSkewMs < now) return null;
+    // The 3.0 manifest grant: workspace:"manifest", sandboxId may be EMPTY
+    // (no Daytona sandbox exists for manifest projects) — the projectId IS
+    // the workspace scope. 2.0-era sandbox grants keep their sandboxId.
+    const workspace = payload["workspace"] === "manifest" || payload["workspace"] === "sandbox"
+      ? (payload["workspace"] as "manifest" | "sandbox")
+      : null;
+    const sandboxId = typeof payload["sandboxId"] === "string" ? payload["sandboxId"] : "";
+    if (workspace !== "manifest" && !sandboxId) return null;
     return {
       projectId: payload["projectId"],
-      sandboxId: payload["sandboxId"],
+      sandboxId,
+      workspace,
       userId: typeof payload["userId"] === "string" ? payload["userId"] : "unknown",
       expiresAt: payload["exp"],
     };

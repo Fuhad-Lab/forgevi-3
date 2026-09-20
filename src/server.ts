@@ -13,7 +13,16 @@
  */
 
 import { config } from "./config.ts";
-import { abortRun, activeRunCount, getProvider, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, type StartRunInput } from "./runs/manager.ts";
+import { abortRun, activeRunCount, getProvider, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, findLiveRunForProject, liveRunDevPort, type StartRunInput } from "./runs/manager.ts";
+import {
+  projectFiles,
+  projectReadFile,
+  projectWriteFile,
+  projectExec,
+  projectAppUrl,
+  validProjectId,
+  studioSafePath,
+} from "./runs/workspace-service.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
 
 const VERSION = "3.0.0";
@@ -230,6 +239,106 @@ const server = Bun.serve({
       const files = await listRunFiles(filesMatch[1]!);
       if (!files) return json({ files: [], note: "workspace not available (sandbox destroyed)" }, 200, origin);
       return json({ files }, 200, origin);
+    }
+
+    // ── THE STUDIO SURFACE (project workspace — relay-key guarded) ──────
+    // The edge relay verifies the caller owns the project (PostgREST) and
+    // presents X-Engine-Relay-Key; the engine trusts exactly that relay.
+    if (path.startsWith("/workspace/")) {
+      if (!config.relayKey) {
+        return json({ error: "studio surface not configured (ENGINE_RELAY_KEY unset)" }, 503, origin);
+      }
+      const key = request.headers.get("X-Engine-Relay-Key") ?? "";
+      if (key !== config.relayKey) {
+        return json({ error: "forbidden — relay key required" }, 403, origin);
+      }
+      const segments = path.split("/").filter(Boolean); // ["workspace", pid, ...]
+      const projectId = validProjectId(segments[1]);
+      if (!projectId) return json({ error: "invalid project id" }, 400, origin);
+      const op = segments.slice(2).join("/"); // "files" | "file" | "exec" | "preview"
+
+      // GET /workspace/:pid/files — the tree (Files tab)
+      if (op === "files" && request.method === "GET") {
+        try {
+          const files = await projectFiles(projectId);
+          return json({ files }, 200, origin);
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 500, origin);
+        }
+      }
+
+      // GET /workspace/:pid/file?path= — read (text | base64 for binaries)
+      if (op === "file" && request.method === "GET") {
+        const rawPath = url.searchParams.get("path") ?? "";
+        const rel = studioSafePath(rawPath);
+        if (!rel) return json({ error: "invalid path" }, 400, origin);
+        try {
+          const file = await projectReadFile(projectId, rel);
+          if (!file) return json({ error: "file not found" }, 404, origin);
+          return json(file, 200, origin);
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 500, origin);
+        }
+      }
+
+      // POST /workspace/:pid/file {path, content} — a user edit from Files
+      if (op === "file" && request.method === "POST") {
+        const body = await readJsonBody(request);
+        if (!body) return json({ error: "invalid JSON body" }, 400, origin);
+        const rel = studioSafePath(body["path"]);
+        const content = typeof body["content"] === "string" ? body["content"] : null;
+        if (!rel || content === null) return json({ error: "path and content are required" }, 400, origin);
+        if (content.length > 2_000_000) return json({ error: "content too large (max 2MB)" }, 400, origin);
+        try {
+          const { bytes } = await projectWriteFile(projectId, rel, content);
+          // a live run's stream log shows the user's write like an agent write
+          const journal = findLiveRunForProject(projectId);
+          if (journal) {
+            try {
+              journal.append({ type: "file_written", path: rel, bytes, by: "user" });
+            } catch {
+              /* closed journal — fine */
+            }
+          }
+          return json({ ok: true, path: rel, bytes }, 200, origin);
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 500, origin);
+        }
+      }
+
+      // POST /workspace/:pid/exec {command, cwd?} — the studio Terminal
+      if (op === "exec" && request.method === "POST") {
+        const body = await readJsonBody(request);
+        if (!body) return json({ error: "invalid JSON body" }, 400, origin);
+        const command = typeof body["command"] === "string" ? body["command"] : "";
+        if (!command.trim()) return json({ error: "command is required" }, 400, origin);
+        const cwd = typeof body["cwd"] === "string" && studioSafePath(body["cwd"]) ? body["cwd"] : undefined;
+        try {
+          const result = await projectExec(projectId, command, cwd);
+          return json(
+            {
+              exit_code: result.exitCode,
+              stdout: result.stdout,
+              stderr: result.stderr,
+              timed_out: result.timedOut,
+              duration_ms: result.durationMs,
+            },
+            200,
+            origin,
+          );
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 500, origin);
+        }
+      }
+
+      // GET /workspace/:pid/preview — the live run's dev-server URL (if any)
+      if (op === "preview" && request.method === "GET") {
+        const devPort = liveRunDevPort(projectId);
+        const appUrl = devPort ? projectAppUrl(projectId, devPort) : null;
+        return json({ appUrl, devPort, public: Boolean(appUrl && appUrl.startsWith("https://")) }, 200, origin);
+      }
+
+      return notFound(origin);
     }
 
     return notFound(origin);

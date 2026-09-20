@@ -114,6 +114,23 @@ export function getRunJournal(runId: string): RunJournal | null {
   return runs.get(runId)?.journal ?? null;
 }
 
+/** The live (running) run journal for a project — studio writes journal into
+ *  it so the stream log shows user edits like agent writes. Null when idle. */
+export function findLiveRunForProject(projectId: string): RunJournal | null {
+  for (const state of runs.values()) {
+    if (state.projectId === projectId && state.view.status === "running") return state.journal;
+  }
+  return null;
+}
+
+/** The dev port a live run for this project was assigned (preview surface). */
+export function liveRunDevPort(projectId: string): number | null {
+  for (const state of runs.values()) {
+    if (state.projectId === projectId && state.view.status === "running") return state.devPort;
+  }
+  return null;
+}
+
 export function abortRun(runId: string, reason?: string): RunView | null {
   const state = runs.get(runId);
   if (!state) return null;

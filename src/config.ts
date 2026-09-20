@@ -24,6 +24,10 @@ export interface EngineConfig {
 
   otlpEndpoint: string | undefined;
 
+  /** Shared secret guarding the /workspace/* studio surface (the edge relay
+   *  sends X-Engine-Relay-Key after verifying project ownership). */
+  relayKey: string | undefined;
+
   /** 0 = unlimited (default — the user's law: runs end when the agent finishes or the user aborts) */
   maxSteps: number;
   maxWallclockMs: number;
@@ -100,6 +104,8 @@ export function loadConfig(): EngineConfig {
     b2,
 
     otlpEndpoint: env.OTEL_EXPORTER_OTLP_ENDPOINT || undefined,
+
+    relayKey: env.ENGINE_RELAY_KEY || undefined,
 
     maxSteps: num(env.FORGVI3_MAX_STEPS, 0),
     maxWallclockMs: num(env.FORGVI3_MAX_WALLCLOCK_MS, 0),
