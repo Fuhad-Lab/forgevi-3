@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Forgevi 3.0 — persistent local dev engine launcher.
+Forgevi — persistent local dev engine launcher.
 
 The sandbox bash tool reaps every descendant of the shell when a command
 finishes. A classic double-fork daemon (reparented to PID 1) escapes that
-reaper, so the engine keeps serving the preview-panel console on :3010.
+reaper, so the engine keeps serving on :3010.
+
+Local LLM lane: the mock OpenAI-compatible gateway (/home/z/f3test/
+mock-llm.py on :4599) — start that first:
+    python3 /home/z/f3test/mock-llm.py
 
 Usage:
     python3 dev-daemon.py            # start (no-op if already listening)
@@ -12,16 +16,19 @@ Usage:
 """
 import os
 import socket
-import subprocess
 import sys
 
 ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = 3010
 ENV = {
     **os.environ,
-    "ENGINE_PROVIDER": "zai",  # real GLM agent via z-ai-web-dev-sdk (parent node_modules)
+    # the local mock gateway lane (no external budget spent)
+    "OPENROUTER_API_KEY": "mock-key",
+    "OPENROUTER_BASE_URL": "http://127.0.0.1:4599/v1",
+    "ENGINE_MODEL": "mock/mock-agent",
     "ENGINE_PORT": str(PORT),
     "ENGINE_RELAY_KEY": "e107cadbb0f8fb29bb0600fcc95f3ed45a378142723e290b",
+    "FORGVI3_ALLOW_UNGRANTED_PROJECTS": "1",
 }
 
 
@@ -32,6 +39,10 @@ def listening(port: int) -> bool:
 
 
 def main() -> None:
+    if "--status" in sys.argv:
+        os.system("curl -sS -m 5 http://127.0.0.1:3010/health")
+        print()
+        return
     if listening(PORT):
         print(f"engine already listening on :{PORT}")
         return

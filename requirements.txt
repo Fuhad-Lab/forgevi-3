@@ -1,0 +1,6 @@
+# The REAL OpenHands SDK — pinned. 1.49.1 regressed against NIM-class
+# gateways (telemetry._cache_buckets reads fields litellm's wrapper
+# deletes; AttributeError on every completion). 1.44.1 is verified
+# end-to-end. Revisit only with a gateway regression check.
+openhands-sdk==1.44.1
+openhands-tools==1.44.1

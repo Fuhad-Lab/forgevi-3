@@ -1,11 +1,11 @@
 /**
- * Forgevi 3.0 — the run manager.
+ * Forgevi — the run manager.
  *
  * A run is one async function in one process: verify grant → boot sandbox
- * (silent restore + uploads + scaffold) → discover MCP → run the ONE
- * agent loop → persist snapshot (silent) → close the journal. No Redis
- * bus, no Temporal workflow, no orchestrator — durability comes from the
- * snapshot at run end and the frontend's honest 404-poll fallback.
+ * (silent restore + uploads + scaffold) → run ONE OpenHands agent in the
+ * workspace → persist snapshot (silent) → close the journal. No Redis
+ * bus, no Temporal workflow, no orchestrator — and NO custom agent loop:
+ * the openhands-sdk owns the loop, the tools, and the finish decision.
  */
 
 import { randomUUID } from "node:crypto";
@@ -14,22 +14,11 @@ import { verifyWorkspaceGrant } from "../grant.ts";
 import { createSandbox, type SandboxAdapter } from "../e2b-backblaze/sandbox.ts";
 import { createStorage } from "../e2b-backblaze/storage.ts";
 import { bootWorkspace, persistWorkspace } from "../e2b-backblaze/template.ts";
-import { createZaiProvider } from "../llm/zai.ts";
-import { createMockProvider } from "../llm/mock.ts";
-import { createOpenRouterProvider } from "../llm/openrouter.ts";
-import { createNvidiaProvider } from "../llm/nvidia.ts";
-import type { ChatMessage, ChatResult, LLMProvider, ToolDef } from "../llm/provider.ts";
-import { assembleContext, type ChatHistoryRow } from "../agentic-framework/context.ts";
-import { runAgentLoop, type AgentLoopResult } from "../agentic-framework/agent.ts";
-import { CORE_TOOLS, type AgentTool, type ToolCtx } from "../tools/registry.ts";
-import { browserPreviewTool } from "../tools/browser.ts";
-import { analyzeImageTool } from "../tools/sub-agents/analyze-image.ts";
-import { discoverMcpSessions, closeSessions } from "../tools/mcp/discovery.ts";
-import { mcpToolsForSession } from "../tools/mcp/tools.ts";
-import type { McpSession } from "../tools/mcp/client.ts";
+import { resolveLlmConfig, runOpenHands, type LlmConfig, type OpenHandsEvent } from "../openhands.ts";
+import { buildTaskPrompt, type ChatHistoryRow } from "../task.ts";
 import { normalizeUploads, type RawUpload } from "../uploads/uploads.ts";
 import { RunJournal, type JournalEvent } from "./journal.ts";
-import { counters, initTelemetry, withSpan } from "../tools/monitoring/telemetry.ts";
+import { counters, initTelemetry } from "../tools/monitoring/telemetry.ts";
 
 export interface StartRunInput {
   objective: string;
@@ -78,53 +67,11 @@ interface RunState {
   sandbox?: SandboxAdapter;
 }
 
-// ── provider singleton ─────────────────────────────────────────────────
+// ── LLM resolution ─────────────────────────────────────────────────────
 
-let providerPromise: Promise<LLMProvider> | null = null;
-
-/** OpenRouter's free tier is account-wide: once the daily request budget
- *  is gone EVERY model on the chain 429s with the same signature. */
-function isFreeTierExhausted(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /free-models-per-day|free_tier_daily|Rate limit exceeded/i.test(msg);
-}
-
-/** Wrap the openrouter provider with the NVIDIA NIM failover lane. Once a
- *  free-tier exhaustion is seen, the wrapper latches to NVIDIA for the
- *  rest of the process's lifetime (the OpenRouter budget will not come
- *  back until 00:00 UTC — retrying it mid-run just burns steps). */
-function withNvidiaFailover(primary: LLMProvider): LLMProvider {
-  if (!config.nvidia) return primary;
-  let latched: LLMProvider | null = null;
-  return {
-    name: "openrouter+nvidia",
-    model: primary.model,
-    async chat(messages: ChatMessage[], tools: ToolDef[], opts): Promise<ChatResult> {
-      if (latched) return latched.chat(messages, tools, opts);
-      try {
-        return await primary.chat(messages, tools, opts);
-      } catch (err) {
-        if (opts?.signal?.aborted || !isFreeTierExhausted(err)) throw err;
-        console.warn(`[provider] OpenRouter free tier exhausted — failing over to NVIDIA NIM for the rest of this process`);
-        latched = createNvidiaProvider();
-        return latched.chat(messages, tools, opts);
-      }
-    },
-  };
-}
-
-export function getProvider(): Promise<LLMProvider> {
-  if (!providerPromise) {
-    providerPromise = (async () => {
-      if (config.provider === "mock") return createMockProvider();
-      if (config.provider === "zai") return await createZaiProvider();
-      return withNvidiaFailover(createOpenRouterProvider());
-    })().catch((err) => {
-      providerPromise = null; // honest retry on next request
-      throw err;
-    });
-  }
-  return providerPromise;
+/** Resolves the run's LLM or fails with the honest config error. */
+export function getLlmConfig() {
+  return resolveLlmConfig();
 }
 
 // ── manager state ──────────────────────────────────────────────────────
@@ -290,6 +237,34 @@ function pickDevPort(): number {
   return DEV_PORT_RANGE_START + Math.floor(Math.random() * DEV_PORT_RANGE_SIZE);
 }
 
+interface OpenHandsOutcome {
+  status: "complete" | "incomplete";
+  summary: string;
+  remainingIssues: string[];
+  stopReason: string;
+  actions: number;
+}
+
+/** Map an OpenHands worker event onto the Forgvi journal vocabulary. */
+function journalEventFor(ev: OpenHandsEvent): JournalEvent | null {
+  switch (ev.type) {
+    case "thinking":
+      return { type: "assistant_thinking", text: ev.text };
+    case "message":
+      return { type: "assistant_text", text: ev.text };
+    case "action":
+      return { type: "tool_used", tool: ev.tool, status: "ok", detail: ev.detail ?? ev.tool };
+    case "file":
+      return { type: "file_written", path: ev.path, by: "agent" };
+    case "error":
+      return { type: "tool_used", tool: "openhands", status: "error", detail: ev.error };
+    case "finished":
+      return null; // terminal — handled by the executor
+    default:
+      return null;
+  }
+}
+
 async function executeRun(
   run: RunState,
   input: StartRunInput,
@@ -311,17 +286,13 @@ async function executeRun(
   });
 
   let sandbox: SandboxAdapter | null = null;
-  let sessions: McpSession[] = [];
-  let outcome: AgentLoopResult | null = null;
+  let outcome: OpenHandsOutcome | null = null;
   let hardError: string | null = null;
 
   try {
-    sandbox = await withSpan("forgevi.sandbox.create", { "forgevi.run_id": view.runId }, async () => {
-      const adapter = await createSandbox(workspaceKey ?? `run-${view.runId.slice(0, 12)}`);
-      run.devPort = pickDevPort();
-      run.sandbox = adapter;
-      return adapter;
-    });
+    sandbox = await createSandbox(workspaceKey ?? `run-${view.runId.slice(0, 12)}`);
+    run.devPort = pickDevPort();
+    run.sandbox = sandbox;
 
     // SILENT boot: restore + uploads + scaffold — never in the stream
     await bootWorkspace({ sandbox, storage: createStorage(), workspaceKey, uploads: uploadFiles });
@@ -349,25 +320,12 @@ async function executeRun(
       });
     }
 
-    const provider = await getProvider();
+    const llmResult = getLlmConfig();
+    if (!llmResult.ok || !llmResult.llm) {
+      throw new Error(llmResult.error || "the engine has no LLM configured");
+    }
 
-    // MCP auto-discovery (failures skip honestly — stderr only)
-    sessions = await discoverMcpSessions().then((d) => d.sessions);
-
-    const tools: AgentTool[] = [...CORE_TOOLS, browserPreviewTool];
-    if (provider.vision) tools.push(analyzeImageTool); // optional — the agent decides
-    for (const session of sessions) tools.push(...mcpToolsForSession(session));
-
-    const ctx: ToolCtx = {
-      runId: view.runId,
-      sandbox,
-      signal: abort.signal,
-      provider,
-      devPort: run.devPort,
-      emit,
-    };
-
-    const messages = assembleContext(
+    const prompt = buildTaskPrompt(
       {
         objective: view.objective,
         acceptance: view.acceptance,
@@ -379,22 +337,64 @@ async function executeRun(
       Array.isArray(input.chatHistory) ? input.chatHistory : [],
     );
 
-    outcome = await runAgentLoop({
-      runId: view.runId,
-      provider,
-      tools,
-      messages,
-      ctx,
-      emit,
-      signal: abort.signal,
-      ceilings: { maxSteps: config.maxSteps, maxWallclockMs: config.maxWallclockMs, maxTokens: config.maxTokens },
-      startedAt: view.startedAt,
-    });
+    // THE mandate: ONE real OpenHands agent, one conversation, one workspace.
+    const runLane = async (llm: LlmConfig): Promise<OpenHandsOutcome | null> => {
+      let actions = 0;
+      let laneOutcome: OpenHandsOutcome | null = null;
+      for await (const ev of runOpenHands({
+        workspace: sandbox!.cwd,
+        prompt,
+        llm,
+        signal: abort.signal,
+      })) {
+        if (ev.type === "finished") {
+          laneOutcome = {
+            status: ev.status === "complete" ? "complete" : "incomplete",
+            summary: ev.summary || "(no summary provided)",
+            remainingIssues: Array.isArray(ev.issues) ? ev.issues.filter((i) => typeof i === "string" && i.trim()).slice(0, 20) : [],
+            stopReason: ev.status === "complete" ? "finish" : abort.signal.aborted ? "aborted" : "openhands",
+            actions,
+          };
+          break;
+        }
+        if (ev.type === "action") {
+          actions += 1;
+          counters.steps.add(1);
+          emit(journalEventFor(ev) ?? { type: "tool_used", tool: ev.tool, status: "ok" }, { iteration: actions });
+        } else {
+          const event = journalEventFor(ev);
+          if (event) emit(event);
+        }
+      }
+      return laneOutcome;
+    };
+
+    outcome = await runLane(llmResult.llm);
+
+    // The OpenRouter free tier is account-wide (50 req/day): when it is
+    // exhausted every model 429s with the same signature — the run dies.
+    // If the NVIDIA NIM lane is configured, ONE honest lane switch keeps
+    // the platform building. Announced in the stream, never silent.
+    const exhausted =
+      outcome &&
+      !abort.signal.aborted &&
+      llmResult.nvidia &&
+      /free-models-per-day|free_tier_daily|add 10 credits/i.test(
+        `${outcome.summary} ${outcome.remainingIssues.join(" ")}`,
+      );
+    if (exhausted && outcome && llmResult.nvidia) {
+      emit({
+        type: "tool_used",
+        tool: "engine",
+        status: "ok",
+        detail: "OpenRouter free tier exhausted — switching this run to the NVIDIA lane",
+      });
+      outcome = await runLane(llmResult.nvidia);
+    }
   } catch (err) {
     hardError = err instanceof Error ? err.message : String(err);
     console.error(`[run ${view.runId}] execution error: ${hardError}`);
   } finally {
-    await closeSessions(sessions);
     // SILENT persist — the workspace survives, the stream never mentions it
     if (sandbox) {
       await persistWorkspace({ sandbox, storage: createStorage(), workspaceKey }).catch((err) => {
@@ -425,7 +425,7 @@ async function executeRun(
       summary: outcome.summary,
       remainingIssues: outcome.remainingIssues,
       stopReason: outcome.stopReason,
-      usage: outcome.usage,
+      usage: { promptTokens: 0, completionTokens: 0 },
     };
     if (outcome.stopReason === "error") {
       emit({ type: "run_error", error: outcome.summary });
@@ -434,8 +434,8 @@ async function executeRun(
       type: "run_finished",
       status: outcome.status,
       summary: outcome.summary,
-      verificationScore: 0, // honest: no verifier role in 3.0 — the agent self-verified
-      iterations: outcome.steps,
+      verificationScore: 0, // honest: the agent self-verified via OpenHands
+      iterations: outcome.actions || view.iteration,
       durationMs: finishedAt - view.startedAt,
       remainingIssues: outcome.remainingIssues,
     });

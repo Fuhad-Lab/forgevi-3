@@ -1,17 +1,15 @@
 {
   "name": "forgevi-3",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
-  "description": "Forgevi 3.0 — one OpenHands-style agent, an E2B sandbox, and nothing else.",
+  "description": "Forgevi 3.1 — the real OpenHands agent (openhands-sdk) behind the Forgvi wire contract.",
   "scripts": {
     "dev": "bun --hot src/server.ts",
     "start": "bun src/server.ts",
-    "check": "tsc --noEmit",
-    "probe": "bun probe/e2e-local-run.mjs"
+    "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/exporter-prometheus": "^0.222.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",

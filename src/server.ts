@@ -13,7 +13,8 @@
  */
 
 import { config } from "./config.ts";
-import { abortRun, activeRunCount, getProvider, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, findLiveRunForProject, liveRunDevPort, type StartRunInput } from "./runs/manager.ts";
+import { abortRun, activeRunCount, getLlmConfig, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, findLiveRunForProject, liveRunDevPort, type StartRunInput } from "./runs/manager.ts";
+import { probeOpenHands, probeOpenHandsSync } from "./openhands.ts";
 import {
   projectFiles,
   projectReadFile,
@@ -29,8 +30,8 @@ import {
 } from "./runs/workspace-service.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
 
-const VERSION = "3.0.0";
-const KERNEL = "openhands-codeact";
+const VERSION = "3.1.0";
+const KERNEL = "openhands-sdk";
 
 const ALLOWED_ORIGINS = new Set([
   "https://forgeyn.com.ng",
@@ -130,19 +131,21 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown> |
   }
 }
 
-function providerLabel(): string {
-  if (config.provider === "zai") return "zai-glm (dev)";
-  if (config.provider === "mock") return "mock";
-  return config.model ?? "nvidia/nemotron-3-super-120b-a12b:free";
-}
+// Warm the OpenHands capability probe once at boot so /health is fast.
+void probeOpenHands().catch(() => undefined);
 
-/** True when the NVIDIA NIM fallback lane is configured. */
-function nvidiaFallback(): boolean {
-  return config.provider === "openrouter" && !!config.nvidia?.key;
+function providerLabel(): string {
+  const llm = getLlmConfig();
+  if (!llm.ok || !llm.llm) return "unconfigured";
+  return llm.llm.model.replace(/^openai\//, "");
 }
 
 const server = Bun.serve({
   port: config.port,
+  // SSE streams idle between events — Bun's default 10s idle timeout kills
+  // them mid-run (live-observed). 255s is the ceiling; the 15s pings keep
+  // every healthy stream far below it.
+  idleTimeout: 255,
   async fetch(request): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
@@ -154,15 +157,9 @@ const server = Bun.serve({
 
     // ── health ──
     if (path === "/health" && request.method === "GET") {
-      let ok = true;
-      let model = providerLabel();
-      try {
-        const provider = await getProvider();
-        model = provider.model;
-      } catch (err) {
-        ok = false;
-        model = `${providerLabel()} (unconfigured: ${err instanceof Error ? err.message : String(err)})`;
-      }
+      const llm = getLlmConfig();
+      const probe = probeOpenHandsSync();
+      const ok = llm.ok && (probe?.ok ?? false);
       return json(
         {
           ok,
@@ -170,8 +167,10 @@ const server = Bun.serve({
           engine: "forgvi",
           version: VERSION,
           kernel: KERNEL,
-          model,
-          fallback: nvidiaFallback() ? "nvidia-nim" : undefined,
+          model: llm.ok && llm.llm ? llm.llm.model.replace(/^openai\//, "") : llm.error,
+          agent: probe
+            ? { ok: probe.ok, sdk: probe.sdk, tools: probe.tools, error: probe.error }
+            : { ok: false, error: "probing" },
           sandbox: config.e2bKey ? "e2b" : "local",
           storage: config.b2 ? "backblaze-b2" : "local-disk",
           activeRuns: activeRunCount(),
@@ -184,16 +183,16 @@ const server = Bun.serve({
 
     // ── stats ──
     if (path === "/stats" && request.method === "GET") {
+      const probe = probeOpenHandsSync();
       return json(
         {
           ok: true,
           version: VERSION,
           kernel: KERNEL,
-          provider: config.provider,
           model: providerLabel(),
+          agent: probe ? { ok: probe.ok, sdk: probe.sdk, tools: probe.tools } : { ok: false, error: "probing" },
           sandbox: config.e2bKey ? "e2b" : "local",
           storage: config.b2 ? "backblaze-b2" : "local-disk",
-          mcpServers: config.mcpServers.length,
           activeRuns: activeRunCount(),
           totalRuns: totalRunCount(),
           ceilings: { steps: config.maxSteps, wallclockMs: config.maxWallclockMs, tokens: config.maxTokens },
@@ -416,4 +415,4 @@ const server = Bun.serve({
   },
 });
 
-console.error(`[forgevi-3] listening on :${server.port} — kernel=${KERNEL} provider=${config.provider} sandbox=${config.e2bKey ? "e2b" : "local"} storage=${config.b2 ? "backblaze-b2" : "local-disk"}`);
+console.error(`[forgevi-3] listening on :${server.port} — kernel=${KERNEL} sandbox=${config.e2bKey ? "e2b" : "local"} storage=${config.b2 ? "backblaze-b2" : "local-disk"}`);
