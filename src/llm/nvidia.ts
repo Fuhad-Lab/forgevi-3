@@ -81,7 +81,10 @@ async function callNim(
       body: JSON.stringify({ ...body, model }),
     });
   } catch (err) {
-    if (!signal?.aborted && (err as Error)?.name === "AbortError") {
+    const name = (err as Error)?.name;
+    // AbortSignal.timeout() aborts with a DOMException named "TimeoutError";
+    // caller-initiated aborts are "AbortError". Only the former is ours.
+    if (!signal?.aborted && (name === "AbortError" || name === "TimeoutError" || /timed? ?out/i.test(String((err as Error)?.message)))) {
       throw Object.assign(new Error(`nvidia ${model}: no response within ${timeoutMs / 1000}s (request timed out)`), {
         status: 504,
       });
