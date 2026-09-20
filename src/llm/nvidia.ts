@@ -62,16 +62,32 @@ async function callNim(
   signal?: AbortSignal,
 ): Promise<ChatResult> {
   const base = (config.nvidia?.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
-  const res = await fetch(`${base}/chat/completions`, {
-    method: "POST",
-    signal,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.nvidia?.key}`,
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ ...body, model }),
-  });
+  // Per-call timeout: NIM occasionally hangs on long tool-calling requests
+  // (live-observed: a turn with no response for 16+ minutes). Bounded waits
+  // let the chain retry the next model instead of stalling the run forever.
+  const timeoutMs = 150_000;
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const callSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  let res: Response;
+  try {
+    res = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      signal: callSignal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.nvidia?.key}`,
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ ...body, model }),
+    });
+  } catch (err) {
+    if (!signal?.aborted && (err as Error)?.name === "AbortError") {
+      throw Object.assign(new Error(`nvidia ${model}: no response within ${timeoutMs / 1000}s (request timed out)`), {
+        status: 504,
+      });
+    }
+    throw err;
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw Object.assign(new Error(`nvidia ${model} ${res.status}: ${text.slice(0, 300)}`), {

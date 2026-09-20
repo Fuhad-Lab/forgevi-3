@@ -68,17 +68,31 @@ async function callOpenRouter(
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<ChatResult> {
-  const res = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    signal,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.openrouterKey}`,
-      "HTTP-Referer": "https://forgeyn.com.ng",
-      "X-Title": "Forgevi 3.0",
-    },
-    body: JSON.stringify({ ...body, model }),
-  });
+  // Per-call timeout: a hung upstream must not stall the run forever.
+  const timeoutMs = 120_000;
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const callSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  let res: Response;
+  try {
+    res = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      signal: callSignal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.openrouterKey}`,
+        "HTTP-Referer": "https://forgeyn.com.ng",
+        "X-Title": "Forgevi 3.0",
+      },
+      body: JSON.stringify({ ...body, model }),
+    });
+  } catch (err) {
+    if (!signal?.aborted && (err as Error)?.name === "AbortError") {
+      throw Object.assign(new Error(`openrouter ${model}: no response within ${timeoutMs / 1000}s (request timed out)`), {
+        status: 504,
+      });
+    }
+    throw err;
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw Object.assign(new Error(`openrouter ${model} ${res.status}: ${text.slice(0, 300)}`), {
