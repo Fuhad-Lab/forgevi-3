@@ -38,6 +38,10 @@ export interface StartRunInput {
   appName?: string;
   platform?: string;
   chatHistory?: ChatHistoryRow[];
+  /** THE UPLOAD-FOLDER LAW: filenames the user uploaded through the
+   *  workspace-upload action before starting the run — the engine
+   *  enhances the USER prompt with the uploads/ manifest. */
+  uploadedFiles?: string[];
   /** DEV-ONLY (FORGVI3_ALLOW_UNGRANTED_PROJECTS=1): bind without a grant. */
   projectId?: string;
 }
@@ -289,6 +293,21 @@ async function executeRun(
 
     // SILENT boot: restore + uploads + scaffold — never in the stream
     await bootWorkspace({ sandbox, storage: createStorage(), workspaceKey, uploads: uploadFiles });
+
+    // THE UPLOAD-FOLDER LAW (pre-uploaded files): uploads that landed
+    // through the workspace-upload action BEFORE this run started — the
+    // manifest enhances the USER prompt (never the system prompt).
+    if (uploadManifest.length === 0) {
+      const onDisk = await sandbox.listDir("uploads", { maxEntries: 50 }).catch(() => []);
+      for (const entry of onDisk) {
+        if (entry.type !== "file") continue;
+        uploadManifest.push({
+          path: entry.path.replace(/^uploads\//, ""),
+          contentType: "binary",
+          bytes: entry.size ?? 0,
+        });
+      }
+    }
 
     if (view.workspace.bound) {
       emit({

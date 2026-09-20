@@ -20,6 +20,10 @@ import {
   projectWriteFile,
   projectExec,
   projectAppUrl,
+  projectUpload,
+  projectUploadsManifest,
+  projectStatus,
+  projectHeartbeat,
   validProjectId,
   studioSafePath,
 } from "./runs/workspace-service.ts";
@@ -205,6 +209,7 @@ const server = Bun.serve({
         ...(typeof body["appName"] === "string" ? { appName: body["appName"] } : {}),
         ...(typeof body["platform"] === "string" ? { platform: body["platform"] } : {}),
         ...(Array.isArray(body["chatHistory"]) ? { chatHistory: body["chatHistory"] as StartRunInput["chatHistory"] } : {}),
+        ...(Array.isArray(body["uploadedFiles"]) ? { uploadedFiles: body["uploadedFiles"].filter((f): f is string => typeof f === "string") } : {}),
         ...(typeof body["projectId"] === "string" ? { projectId: body["projectId"] } : {}),
       };
       const result = startRun(input);
@@ -326,6 +331,66 @@ const server = Bun.serve({
             200,
             origin,
           );
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 500, origin);
+        }
+      }
+
+      // POST /workspace/:pid/upload {filename, content_b64} — THE
+      // UPLOAD-FOLDER LAW: binary-safe user uploads → uploads/.
+      if (op === "upload" && request.method === "POST") {
+        const body = await readJsonBody(request);
+        if (!body) return json({ error: "invalid JSON body" }, 400, origin);
+        const filename = typeof body["filename"] === "string" ? body["filename"] : "";
+        const contentB64 = typeof body["content_b64"] === "string" ? body["content_b64"] : "";
+        if (!filename || !contentB64) return json({ error: "filename and content_b64 are required" }, 400, origin);
+        try {
+          const { bytes } = await projectUpload(projectId, filename, contentB64);
+          return json({ ok: true, filename, bytes, folder: "uploads/" }, 200, origin);
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 400, origin);
+        }
+      }
+
+      // GET /workspace/:pid/status — the seat status (studio banner/preview)
+      if (op === "status" && request.method === "GET") {
+        const devPort = liveRunDevPort(projectId);
+        const status = await projectStatus(projectId, devPort);
+        return json({ driver: status.driver, configured: status.configured, session: status.session, previewPort: status.previewPort }, 200, origin);
+      }
+
+      // POST /workspace/:pid/terminal — the E2B-mandate exec alias
+      if (op === "terminal" && request.method === "POST") {
+        const body = await readJsonBody(request);
+        if (!body) return json({ error: "invalid JSON body" }, 400, origin);
+        const command = typeof body["command"] === "string" ? body["command"] : "";
+        if (!command.trim()) return json({ error: "command is required" }, 400, origin);
+        const cwd = typeof body["cwd"] === "string" && studioSafePath(body["cwd"]) ? body["cwd"] : undefined;
+        try {
+          const result = await projectExec(projectId, command, cwd);
+          return json(
+            { exit_code: result.exitCode, stdout: result.stdout, stderr: result.stderr, timed_out: result.timedOut, duration_ms: result.durationMs },
+            200,
+            origin,
+          );
+        } catch (err) {
+          return json({ error: err instanceof Error ? err.message : String(err) }, 500, origin);
+        }
+      }
+
+      // POST /workspace/:pid/heartbeat — keep the seat warm
+      if (op === "heartbeat" && request.method === "POST") {
+        await projectHeartbeat(projectId);
+        return json({ ok: true }, 200, origin);
+      }
+
+      // GET /workspace/:pid/manifest — the manifest-shaped file list
+      // (the legacy action name — same tree, manifest vocabulary).
+      if (op === "manifest" && request.method === "GET") {
+        try {
+          const files = await projectFiles(projectId);
+          const manifest = files.map((f) => ({ path: f.path, size: f.size ?? 0, updated_at: 0 }));
+          return json({ projectId, revision: manifest.length, files: manifest }, 200, origin);
         } catch (err) {
           return json({ error: err instanceof Error ? err.message : String(err) }, 500, origin);
         }
