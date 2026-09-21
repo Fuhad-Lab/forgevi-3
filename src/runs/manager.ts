@@ -14,7 +14,13 @@ import { verifyWorkspaceGrant } from "../grant.ts";
 import { createSandbox, type SandboxAdapter } from "../e2b-backblaze/sandbox.ts";
 import { createStorage } from "../e2b-backblaze/storage.ts";
 import { bootWorkspace, persistWorkspace } from "../e2b-backblaze/template.ts";
-import { holdProjectSandbox, releaseProjectSandbox, getProjectSandbox } from "./workspace-service.ts";
+import {
+  ensureProjectDevServer,
+  holdProjectSandbox,
+  releaseProjectSandbox,
+  getProjectSandbox,
+  rememberProjectDevPort,
+} from "./workspace-service.ts";
 import {
   resolveLlmConfig,
   resolveLaneLlm,
@@ -118,14 +124,6 @@ export function getRunJournal(runId: string): RunJournal | null {
 export function findLiveRunForProject(projectId: string): RunJournal | null {
   for (const state of runs.values()) {
     if (state.projectId === projectId && state.view.status === "running") return state.journal;
-  }
-  return null;
-}
-
-/** The dev port a live run for this project was assigned (preview surface). */
-export function liveRunDevPort(projectId: string): number | null {
-  for (const state of runs.values()) {
-    if (state.projectId === projectId && state.view.status === "running") return state.devPort;
   }
   return null;
 }
@@ -274,7 +272,17 @@ function journalEventFor(ev: OpenHandsEvent): JournalEvent | null {
     case "action":
       return { type: "tool_used", tool: ev.tool, status: "ok", detail: ev.detail ?? ev.tool };
     case "file":
-      return { type: "file_written", path: ev.path, by: "agent" };
+      // THE CODE-STREAM LAW (user fix 2026-09-21): the worker caps and
+      // forwards the file BODY — the studio's fragments code panel
+      // streams real code, not just paths.
+      return {
+        type: "file_written",
+        path: ev.path,
+        by: "agent",
+        ...(typeof (ev as { content?: string }).content === "string"
+          ? { content: (ev as { content: string }).content }
+          : {}),
+      };
     case "error":
       return { type: "tool_used", tool: "openhands", status: "error", detail: ev.error };
     case "finished":
@@ -324,7 +332,37 @@ async function executeRun(
     }
     run.devPort = pickDevPort();
     run.sandbox = sandbox;
+    // THE DEV-SERVER LAW: the port lands on the PROJECT entry — the
+    // preview surface serves it for the sandbox's whole life, not just
+    // the run's.
+    if (run.projectId && run.devPort) rememberProjectDevPort(run.projectId, run.devPort);
 
+    // THE PREVIEW-WATCHER LAW (user fix 2026-09-21): the moment the
+    // agent's dev server answers on the assigned port, the journal says
+    // so — the studio's preview flips live MID-RUN instead of waiting
+    // for the run to end. One announcement per run (then the watcher
+    // exits); a stopped/restarted server is the preview route's business.
+    void (async () => {
+      if (!sandbox || !run.devPort) return;
+      const port = run.devPort;
+      const url = sandbox.appUrl(port);
+      for (let i = 0; i < 200 && !abort.signal.aborted; i++) {
+        await new Promise((r) => setTimeout(r, 12_000));
+        if (abort.signal.aborted || view.status !== "running") return;
+        try {
+          const probe = await sandbox.exec(
+            `curl -s -o /dev/null -m 4 -w "%{http_code}" http://127.0.0.1:${port} || true`,
+            { timeoutMs: 8_000 },
+          );
+          if (/^\d{3}$/.test(probe.stdout.trim()) && probe.stdout.trim() !== "000") {
+            emit({ type: "dev_server_ready", appUrl: url, devPort: port });
+            return;
+          }
+        } catch {
+          /* probe failures just mean not-yet */
+        }
+      }
+    })();
     // SILENT boot: restore + uploads + scaffold — never in the stream.
     // A shared sandbox skips the restore (getProjectSandbox already
     // restored a fresh one, and a LIVE one must never be snapshotted over).
@@ -483,6 +521,19 @@ async function executeRun(
         // the idle reaper owns its lifecycle (release re-arms the TTL).
         // Never destroy the machine the studio surface is still serving.
         releaseProjectSandbox(run.projectId);
+        // THE POST-RUN PREVIEW LAW (user fix 2026-09-21): the preview must
+        // NOT die with the run. If the agent left a dev server running, the
+        // announcement below simply confirms it; if it did not, the engine
+        // starts one on the remembered port (best-effort, never blocks the
+        // run's terminal settle — the journal is already closed by then, so
+        // the studio learns through the preview route / restart button).
+        if (!abort.signal.aborted) {
+          void ensureProjectDevServer(run.projectId).catch((err) => {
+            console.error(
+              `[run ${view.runId}] post-run dev-server ensure failed: ${err instanceof Error ? err.message.slice(0, 300) : String(err)}`,
+            );
+          });
+        }
       } else {
         await sandbox.destroy();
       }
@@ -514,6 +565,22 @@ async function executeRun(
     };
     if (outcome.stopReason === "error") {
       emit({ type: "run_error", error: outcome.summary });
+    }
+    // THE PREVIEW-CONFIRMATION LAW: before the terminal frame, announce the
+    // live preview URL when the dev server is answering — the studio flips
+    // its preview surface the instant the run settles.
+    if (sharedSandbox && run.projectId && run.devPort && sandbox && !abort.signal.aborted) {
+      try {
+        const probe = await sandbox.exec(
+          `curl -s -o /dev/null -m 4 -w "%{http_code}" http://127.0.0.1:${run.devPort} || true`,
+          { timeoutMs: 8_000 },
+        );
+        if (/^\d{3}$/.test(probe.stdout.trim()) && probe.stdout.trim() !== "000") {
+          emit({ type: "dev_server_ready", appUrl: sandbox.appUrl(run.devPort), devPort: run.devPort });
+        }
+      } catch {
+        /* not serving — the post-run ensure owns it */
+      }
     }
     emit({
       type: "run_finished",

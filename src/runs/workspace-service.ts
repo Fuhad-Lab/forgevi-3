@@ -57,6 +57,12 @@ interface ProjectEntry {
    *  run is executing inside the machine (the E2B window is extended to
    *  the hard cap so the VM outlives the run). */
   holders: number;
+  /** THE DEV-SERVER LAW (user fix 2026-09-21): the dev port OUTLIVES the
+   *  run that was assigned it — the preview surface serves the URL as
+   *  long as the sandbox lives, and `ensureProjectDevServer` can restart
+   *  the server on this exact port after a run ends (or after a manual
+   *  restart request). Null when no port was ever assigned. */
+  devPort: number | null;
 }
 
 const projects = new Map<string, ProjectEntry>();
@@ -120,6 +126,10 @@ async function evict(sandboxId: string): Promise<void> {
     return;
   }
 }
+
+/** THE 55-MINUTE SEAMLESS MIGRATION also kills the in-VM dev server — the
+ *  port memory survives (the fresh VM rehydrates the workspace), and the
+ *  next preview GET / dev-server ensure restarts the server on it. */
 
 /** Arm the age-based lifecycle clocks on a fresh E2B entry. */
 function armLifecycle(pid: string, entry: ProjectEntry): void {
@@ -194,11 +204,176 @@ export async function getProjectSandbox(projectId: string): Promise<SandboxAdapt
     hardCapTimer: null,
     busy: false,
     holders: 0,
+    devPort: null,
   };
   projects.set(projectId, entry);
   touch(entry);
   armLifecycle(projectId, entry);
   return sandbox;
+}
+
+// ── THE DEV-SERVER LAW (user fix 2026-09-21) ────────────────────────────
+// THE PREVIEW-SURVIVAL LAW: a run's dev port is remembered on the PROJECT
+// entry (not the run), the preview route serves the URL for as long as the
+// port actually answers inside the sandbox, and a restart (manual button
+// or the post-run auto-ensure) rehydrates the sandbox from the B2 snapshot
+// when the reaper already evicted it — then boots the dev server on the
+// remembered port. The preview therefore survives: run end → release →
+// idle TTL → eviction → user reopens → rehydrate + restart.
+
+/** Remember the project's dev port (called when a run is assigned one). */
+export function rememberProjectDevPort(projectId: string, port: number): void {
+  const entry = projects.get(projectId);
+  if (entry) entry.devPort = port;
+}
+
+/** The project's remembered dev port — survives run end, dies with the
+ *  entry (eviction/migration clear it implicitly: fresh VM, fresh server). */
+export function projectDevPort(projectId: string): number | null {
+  return projects.get(projectId)?.devPort ?? null;
+}
+
+/** Probe whether anything is serving on a port INSIDE the sandbox. */
+async function probePort(sandbox: SandboxAdapter, port: number): Promise<boolean> {
+  const res = await sandbox.exec(
+    `curl -s -o /dev/null -m 4 -w "%{http_code}" http://127.0.0.1:${port} || true`,
+    { timeoutMs: 8_000 },
+  ).catch(() => null);
+  if (!res) return false;
+  const code = res.stdout.trim();
+  return /^\d{3}$/.test(code) && code !== "000";
+}
+
+/** The project's dev-server preview URL — only when the port answers. */
+export async function projectPreviewUrl(
+  projectId: string,
+): Promise<{ appUrl: string | null; devPort: number | null; serving: boolean }> {
+  const entry = projects.get(projectId);
+  const port = entry?.devPort ?? null;
+  if (!entry || !port) return { appUrl: null, devPort: null, serving: false };
+  const serving = await probePort(entry.sandbox, port);
+  const appUrl = serving ? entry.sandbox.appUrl(port) : null;
+  return { appUrl, devPort: port, serving };
+}
+
+/** One dev-server lifecycle op at a time per project. */
+const devServerOps = new Map<string, Promise<{ appUrl: string | null; devPort: number | null; error?: string }>>();
+
+/** Find the app root inside the workspace — the shallowest directory with
+ *  a package.json carrying a dev/start script (workspace root preferred). */
+async function findAppRoot(sandbox: SandboxAdapter): Promise<string> {
+  const res = await sandbox.exec(
+    `node -e "const fs=require('fs');const cands=['.','app','web','frontend','client','src/app/..'].map(d=>d.replace(/\\/\.$/,''));for(const d of cands){try{const p=JSON.parse(fs.readFileSync(d+'/package.json','utf8'));if(p.scripts&&(p.scripts.dev||p.scripts.start)){console.log(d);process.exit(0)}}catch(e){}}console.log('.')" 2>/dev/null || echo .`,
+    { timeoutMs: 15_000 },
+  ).catch(() => null);
+  const out = (res?.stdout ?? ".").trim().split("\n").filter(Boolean).pop() ?? ".";
+  return out === "" ? "." : out;
+}
+
+/** Kill whatever serves on a port inside the sandbox — belt AND
+ *  suspenders: `pkill -f --` (the `--` separator is MANDATORY — a pattern
+ *  starting with `--` is parsed as pkill OPTIONS and silently no-ops),
+ *  fuser (psmisc), and lsof (procps) — whichever image provides. */
+async function killPort(sandbox: SandboxAdapter, port: number): Promise<void> {
+  await sandbox
+    .exec(
+      [
+        `pkill -f -- "--port ${port}" 2>/dev/null`,
+        `pkill -f -- "port ${port}" 2>/dev/null`,
+        `fuser -k ${port}/tcp 2>/dev/null`,
+        `lsof -t -i:${port} 2>/dev/null | xargs -r kill 2>/dev/null`,
+        "true",
+      ].join("; "),
+      { timeoutMs: 20_000 },
+    )
+    .catch(() => undefined);
+  // a beat for the socket to actually free
+  await new Promise((r) => setTimeout(r, 1_000));
+}
+
+function devServerStartCommand(root: string, port: number): string {
+  // PORT env covers Vite/CRA/Next custom servers; the explicit flags cover
+  // stock Next.js (`next dev`). setsid+nohup: the server must OUTLIVE the
+  // exec call (the E2B commands API kills the command's process group —
+  // a plain child dies with it; a detached session survives).
+  return (
+    `cd ${JSON.stringify(root)} && ` +
+    `if [ -d node_modules ] || npm install --no-audit --no-fund >/tmp/dev-install.log 2>&1; then ` +
+    `(setsid nohup env PORT=${port} npm run dev -- --port ${port} --hostname 0.0.0.0 -p ${port} -H 0.0.0.0 >/tmp/dev-server.log 2>&1 &) && ` +
+    `echo started; else echo "install failed: $(tail -n 5 /tmp/dev-install.log 2>/dev/null)"; fi`
+  );
+}
+
+/** Ensure the project's dev server is running on its remembered port.
+ *
+ * THE REHYDRATION LAW: `getProjectSandbox` restores the B2 snapshot when
+ * the reaper already evicted the VM — a manual restart after eviction
+ * brings BOTH the workspace and the dev server back. Bounded wait: npm
+ * install + next dev compile can legitimately take a while on a fresh VM.
+ */
+export async function ensureProjectDevServer(
+  projectId: string,
+  opts: { restart?: boolean; waitMs?: number } = {},
+): Promise<{ appUrl: string | null; devPort: number | null; error?: string }> {
+  const existing = devServerOps.get(projectId);
+  if (existing) return existing;
+
+  const op = (async () => {
+    try {
+      const sandbox = await getProjectSandbox(projectId);
+      const entry = projects.get(projectId);
+      const port = entry?.devPort ?? null;
+      if (!port) {
+        return { appUrl: null, devPort: null, error: "no dev port assigned for this project yet — run a build first" };
+      }
+
+      if (!opts.restart && (await probePort(sandbox, port))) {
+        return { appUrl: sandbox.appUrl(port), devPort: port };
+      }
+
+      // stop any straggler bound to the port, then start fresh on it
+      await killPort(sandbox, port);
+
+      const root = await findAppRoot(sandbox);
+      await sandbox.exec(devServerStartCommand(root, port), { timeoutMs: 120_000 }).catch(() => undefined);
+
+      const deadline = Date.now() + (opts.waitMs ?? 75_000);
+      while (Date.now() < deadline) {
+        if (await probePort(sandbox, port)) {
+          return { appUrl: sandbox.appUrl(port), devPort: port };
+        }
+        await new Promise((r) => setTimeout(r, 2_500));
+      }
+      const log = await sandbox
+        .exec("tail -n 8 /tmp/dev-server.log /tmp/dev-install.log 2>/dev/null", { timeoutMs: 10_000 })
+        .catch(() => null);
+      return {
+        appUrl: null,
+        devPort: port,
+        error: `the dev server did not answer on port ${port} in time${log?.stdout ? ` — tail: ${log.stdout.slice(0, 400)}` : ""}`,
+      };
+    } catch (err) {
+      return {
+        appUrl: null,
+        devPort: null,
+        error: err instanceof Error ? err.message.slice(0, 400) : String(err),
+      };
+    } finally {
+      devServerOps.delete(projectId);
+    }
+  })();
+
+  devServerOps.set(projectId, op);
+  return op;
+}
+
+/** Stop the project's dev server (the preview pause button). */
+export async function stopProjectDevServer(projectId: string): Promise<{ ok: boolean }> {
+  const entry = projects.get(projectId);
+  const port = entry?.devPort;
+  if (!entry || !port) return { ok: true };
+  await killPort(entry.sandbox, port);
+  return { ok: true };
 }
 
 // ── THE ONE-SANDBOX LAW: run holds ─────────────────────────────────
@@ -306,12 +481,6 @@ export async function projectExec(projectId: string, command: string, cwd?: stri
   const sandbox = await getProjectSandbox(projectId);
   const safeCwd = cwd ? safeRelPath(cwd) ?? undefined : undefined;
   return await sandbox.exec(command, { timeoutMs: 120_000, ...(safeCwd ? { cwd: safeCwd } : {}) });
-}
-
-/** The public app URL for the project's dev server, when one is reachable. */
-export function projectAppUrl(projectId: string, port: number): string | null {
-  const entry = projects.get(projectId);
-  return entry ? entry.sandbox.appUrl(port) : null;
 }
 
 // ── THE UPLOAD-FOLDER LAW (user mandate) ───────────────────────────────

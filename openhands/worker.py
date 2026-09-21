@@ -38,7 +38,7 @@ Event lines (one JSON object per line):
   {"type":"thinking","text":"..."}                # reasoning before an answer
   {"type":"message","text":"..."}                 # assistant message content
   {"type":"action","tool":"...","detail":"..."}   # tool call started
-  {"type":"file","path":"..."}                    # a workspace file write
+  {"type":"file","path":"...","content":"..."}   # a workspace file write (content capped, text files only)
   {"type":"error","error":"..."}                  # agent-side error (may recover)
   {"type":"finished","status":"complete|incomplete","summary":"...","issues":[...]}
 
@@ -139,6 +139,11 @@ def apply_gateway_compat_patch(oh: SimpleNamespace) -> None:
 
 _EDITOR_WRITE_COMMANDS = {"create", "str_replace", "insert"}
 
+# File-content cap for `file` events — the studio's code stream (the
+# fragments panel) shows real file bodies as they land, bounded so a
+# single write can never bloat a journal frame.
+_FILE_EVENT_CONTENT_CAP = 16_000
+
 
 def _text_items(content: Any) -> list[str]:
     out: list[str] = []
@@ -161,7 +166,26 @@ def _parse_args(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def make_sink(state: dict[str, Any]) -> Any:
+def _read_file_event_content(workspace: str, path: str) -> str | None:
+    """Best-effort file body for a `file` event (text only, capped).
+
+    Binary files (or unreadable paths) yield None — the event still
+    carries the path, only the code-stream preview skips the body.
+    """
+    try:
+        candidate = Path(workspace) / str(path).lstrip("/")
+        data = candidate.read_bytes()[:_FILE_EVENT_CONTENT_CAP + 1]
+    except Exception:  # noqa: BLE001 — the path may be outside/absolute/gone
+        return None
+    if b"\x00" in data:
+        return None  # binary — no body in the stream
+    text = data.decode("utf-8", errors="replace")
+    if len(text) > _FILE_EVENT_CONTENT_CAP:
+        text = text[:_FILE_EVENT_CONTENT_CAP] + "\n… (truncated for the stream)"
+    return text
+
+
+def make_sink(state: dict[str, Any], workspace: str) -> Any:
     """One callback — maps OpenHands events onto the engine's event lines."""
 
     def sink(event: Any) -> None:
@@ -199,12 +223,16 @@ def make_sink(state: dict[str, Any]) -> Any:
                     emit({"type": "message", "text": message})
                     state["last_message"] = message
                 return
-            # file writes surface for the Files tab
+            # file writes surface for the Files tab + the code stream
             if "editor" in tool_name.lower() or "file" in tool_name.lower():
                 path = args.get("path")
                 command = args.get("command")
                 if isinstance(path, str) and path and command in _EDITOR_WRITE_COMMANDS:
-                    emit({"type": "file", "path": str(path)})
+                    event: dict[str, Any] = {"type": "file", "path": str(path)}
+                    body = _read_file_event_content(workspace, str(path))
+                    if body is not None:
+                        event["content"] = body
+                    emit(event)
             return
 
         if kind == "ObservationEvent":
@@ -285,7 +313,7 @@ async def run_job(job: dict[str, Any]) -> int:
     conversation = oh.LocalConversation(
         agent=agent,
         workspace=workspace_obj,
-        callbacks=[make_sink(state)],
+        callbacks=[make_sink(state, workspace)],
         max_iteration_per_run=int(job.get("max_iterations") or 500),
         visualizer=None,
         delete_on_close=True,
@@ -318,6 +346,27 @@ async def run_job(job: dict[str, Any]) -> int:
     with contextlib.suppress(Exception):
         await asyncio.to_thread(conversation.close)
 
+    # ── THE FINAL-ANSWER NUDGE (user fix 2026-09-21): the conversation can
+    # legitimately end without a single agent text block (iteration cap,
+    # a model that answered only in tool calls) — the old path then
+    # reported "finished without a final message". ONE bounded nudge
+    # round asks the agent for its final summary; the nudge run carries a
+    # tiny iteration cap so it cannot spiral into a second full build.
+    if not state["last_message"].strip():
+        try:
+            nudge = (
+                "You have reached the end of your work on this task. Reply NOW with your "
+                "final summary for the user: what you built, what works, and anything that "
+                "remains. Do not use any tools — reply with text only."
+            )
+            conversation.max_iteration_per_run = 4
+            conversation.send_message(nudge)
+            await conversation.arun()
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(conversation.close)
+        except Exception as exc:  # noqa: BLE001 — the nudge is best-effort
+            state["errors"].append(f"final-answer nudge failed: {str(exc)[:200]}")
+
     status_obj = getattr(conversation, "execution_status", None)
     status_str = str(getattr(status_obj, "value", status_obj) or "").lower()
     summary = state["last_message"].strip()
@@ -340,8 +389,9 @@ async def run_job(job: dict[str, Any]) -> int:
         issues = [] if final_status == "complete" else [e for e in state["errors"][:10]]
         if not summary:
             summary = (
-                "The agent finished without a final message. Work done so far "
-                "is saved in the workspace."
+                "The agent finished without a final message even after a final-answer "
+                "nudge. Work done so far is saved in the workspace — check the Files "
+                "tab and the running preview."
             )
 
     emit({

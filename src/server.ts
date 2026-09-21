@@ -26,19 +26,22 @@
  */
 
 import { config, writeRuntimeConfigFile, runtimeConfigPath, reloadEngineConfig } from "./config.ts";
-import { abortRun, activeRunCount, getLlmConfig, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, findLiveRunForProject, liveRunDevPort, type StartRunInput } from "./runs/manager.ts";
+import { abortRun, activeRunCount, getLlmConfig, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, findLiveRunForProject, type StartRunInput } from "./runs/manager.ts";
 import { probeOpenHands, probeOpenHandsSync, openrouterPool, reloadOpenRouterPool } from "./openhands.ts";
 import {
   projectFiles,
   projectReadFile,
   projectWriteFile,
   projectExec,
-  projectAppUrl,
   projectUpload,
   projectUploadsManifest,
   projectStatus,
   projectHeartbeat,
   projectSessions,
+  projectDevPort,
+  projectPreviewUrl,
+  ensureProjectDevServer,
+  stopProjectDevServer,
   validProjectId,
   studioSafePath,
 } from "./runs/workspace-service.ts";
@@ -542,7 +545,7 @@ const server = Bun.serve({
 
       // GET /workspace/:pid/status — the seat status (studio banner/preview)
       if (op === "status" && request.method === "GET") {
-        const devPort = liveRunDevPort(projectId);
+        const devPort = projectDevPort(projectId);
         const status = await projectStatus(projectId, devPort);
         return json({ driver: status.driver, configured: status.configured, session: status.session, previewPort: status.previewPort }, 200, origin);
       }
@@ -584,11 +587,55 @@ const server = Bun.serve({
         }
       }
 
-      // GET /workspace/:pid/preview — the live run's dev-server URL (if any)
+      // GET /workspace/:pid/preview — THE PREVIEW-SURVIVAL LAW (user fix
+      // 2026-09-21): the dev port lives on the PROJECT entry, not the run —
+      // the preview serves for as long as the port actually answers inside
+      // the sandbox (run finished, reaper not yet fired — all the same).
+      // Honest null when no port was ever assigned or the sandbox is gone;
+      // the POST dev-server action (below) rehydrates + restarts.
       if (op === "preview" && request.method === "GET") {
-        const devPort = liveRunDevPort(projectId);
-        const appUrl = devPort ? projectAppUrl(projectId, devPort) : null;
-        return json({ appUrl, devPort, public: Boolean(appUrl && appUrl.startsWith("https://")) }, 200, origin);
+        const { appUrl, devPort, serving } = await projectPreviewUrl(projectId);
+        return json(
+          {
+            appUrl,
+            devPort,
+            serving,
+            public: Boolean(appUrl && appUrl.startsWith("https://")),
+          },
+          200,
+          origin,
+        );
+      }
+
+      // POST /workspace/:pid/dev-server {action: "start"|"restart"|"stop"}
+      // — THE MANUAL-RESTART LAW: the studio's Restart button. "start"
+      // no-ops when the server already answers; "restart" always boots a
+      // fresh one; both REHYDRATE the sandbox from the B2 snapshot when
+      // the reaper evicted it (the preview comes back from the dead).
+      if (op === "dev-server" && request.method === "POST") {
+        const body = await readJsonBody(request);
+        const action = typeof body?.["action"] === "string" ? body["action"] : "start";
+        if (action === "stop") {
+          const res = await stopProjectDevServer(projectId);
+          return json({ ...res, appUrl: null, devPort: projectDevPort(projectId) }, 200, origin);
+        }
+        if (action !== "start" && action !== "restart") {
+          return json({ error: 'action must be "start", "restart" or "stop"' }, 400, origin);
+        }
+        const res = await ensureProjectDevServer(projectId, {
+          restart: action === "restart",
+          waitMs: 90_000,
+        });
+        return json(
+          {
+            appUrl: res.appUrl,
+            devPort: res.devPort,
+            public: Boolean(res.appUrl && res.appUrl.startsWith("https://")),
+            ...(res.error ? { error: res.error } : {}),
+          },
+          res.error ? 503 : 200,
+          origin,
+        );
       }
 
       return notFound(origin);
