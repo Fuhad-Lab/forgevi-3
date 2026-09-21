@@ -375,6 +375,13 @@ async function executeRun(
       let laneOutcome: OpenHandsOutcome | null = null;
       for await (const ev of runOpenHands({
         workspace: sandbox!.cwd,
+        // THE E2B WORKSPACE LAW: an E2B run hands the worker the sandbox
+        // connection — the OpenHands agent's tools execute INSIDE the
+        // microVM (the very same sandbox this engine's studio surface
+        // serves). Local runs keep the plain workspace path.
+        ...(sandbox!.kind === "e2b" && sandbox!.apiKey
+          ? { sandbox: { id: sandbox!.id, apiKey: sandbox!.apiKey } }
+          : {}),
         prompt,
         llm,
         signal: abort.signal,

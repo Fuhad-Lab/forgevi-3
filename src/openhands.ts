@@ -123,6 +123,11 @@ export interface OpenHandsRunOpts {
   llm: LlmConfig;
   maxIterations?: number;
   signal: AbortSignal;
+  /** THE E2B WORKSPACE LAW: when the run's sandbox is an E2B microVM, the
+   *  worker connects to the SAME sandbox (Sandbox.connect by id + key) and
+   *  the OpenHands agent's terminal/file tools execute INSIDE it — one
+   *  sandbox shared by the agent and the engine's studio surface. */
+  sandbox?: { id: string; apiKey: string };
 }
 
 function pythonBin(): string {
@@ -151,9 +156,12 @@ export async function* runOpenHands(opts: OpenHandsRunOpts): AsyncGenerator<Open
       ...(opts.llm.baseUrl ? { base_url: opts.llm.baseUrl } : {}),
       max_iterations: opts.maxIterations ?? (Number(process.env.OH_MAX_ITERATIONS || 0) || 500),
       max_output_tokens: Number(process.env.OH_MAX_OUTPUT_TOKENS || 0) || 16384,
+      ...(opts.sandbox ? { sandbox: { id: opts.sandbox.id, api_key: opts.sandbox.apiKey } } : {}),
     }),
   );
-
+  // THE JOB-FILE CLEANUP LAW: the job spec carries live credentials (the
+  // LLM key, the E2B pool key) — the worker reads it immediately and then
+  // deletes it itself (deleting here would race the worker's read).
   const child = spawn(pythonBin(), [workerPath(), "--job", jobFile], {
     cwd: engineRoot(),
     env: { ...process.env },

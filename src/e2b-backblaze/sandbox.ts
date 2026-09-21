@@ -49,6 +49,9 @@ export interface SandboxAdapter {
   readonly id: string;
   /** Absolute path inside the sandbox that is the workspace root. */
   readonly cwd: string;
+  /** E2B only: the pooled API key that spawned this sandbox (the OpenHands
+   *  worker reconnects with it — THE E2B WORKSPACE LAW). Undefined locally. */
+  readonly apiKey?: string;
   /** Age of this sandbox in ms (the migration / hard-cap clocks). */
   ageMs(): number;
   /** THE 55-MINUTE MIGRATION: swap onto a fresh sandbox (E2B; local: no-op). */
@@ -363,23 +366,59 @@ export class E2BSandboxAdapter implements SandboxAdapter {
   readonly id: string;
   readonly cwd = E2B_WORKSPACE;
   private readonly bornAt = Date.now();
+  /** The pooled E2B API key that spawned this sandbox — the OpenHands
+   *  worker reconnects to the SAME sandbox (Sandbox.connect) with it, so
+   *  the agent's terminal/file tools execute INSIDE the microVM while the
+   *  engine's studio surface (exec/files/preview) shares the very same
+   *  sandbox through this adapter. Swapped on migration (fresh sandbox,
+   *  fresh lease). */
+  apiKey: string;
 
   private constructor(
     private sandbox: E2BSandbox,
     id: string,
     private lease: Lease | null,
+    apiKey: string,
   ) {
     this.id = id;
+    this.apiKey = apiKey;
   }
 
   static async create(template: string | undefined): Promise<E2BSandboxAdapter> {
     const { sandbox, lease } = await spawnPooledSandbox(template);
-    // boot shape: a real /workspace directory (silent — never in the stream)
-    await sandbox.commands.run(`mkdir -p ${E2B_WORKSPACE} && cd ${E2B_WORKSPACE} && pwd`, {
-      cwd: E2B_WORKSPACE,
-      timeoutMs: 30_000,
-    });
-    return new E2BSandboxAdapter(sandbox, sandbox.sandboxId, lease);
+    // boot shape: a real, WRITABLE /workspace directory (silent — never in
+    // the stream). THE BOOT-CWD LAW (live-observed 2026-09-21, first
+    // E2B-pool run): the E2B SDK validates `cwd` BEFORE executing the
+    // command — on a fresh sandbox /workspace does not exist yet, so a
+    // boot command carrying cwd=/workspace is rejected with
+    // "[invalid_argument] cwd '/workspace' does not exist" and the whole
+    // run dies at spawn. The mkdir therefore runs on the sandbox's DEFAULT
+    // cwd (no cwd option). THE ROOT-PERMISSION LAW (same session): the
+    // DEFAULT E2B template ships a read-only / owned by root — plain
+    // mkdir fails with EACCES. The default image's `user` carries
+    // passwordless sudo, so the fallback sudo-creates and chowns
+    // /workspace; the baked forgevi template (root-owned RUN mkdir) takes
+    // the plain path. Every later command may use cwd=/workspace because
+    // this one created it.
+    let bootOk = false;
+    try {
+      const boot = await sandbox.commands.run(
+        `mkdir -p ${E2B_WORKSPACE} 2>/dev/null || sudo -n mkdir -p ${E2B_WORKSPACE} && sudo -n chown user:user ${E2B_WORKSPACE}; test -w ${E2B_WORKSPACE}`,
+        { timeoutMs: 30_000 },
+      );
+      bootOk = boot.exitCode === 0;
+    } catch (err) {
+      // THE HONEST-EXIT LAW: the SDK raises on non-zero exits — the
+      // writability test failing surfaces here, not as a return code.
+      const thrown = err as { exitCode?: number };
+      bootOk = typeof thrown.exitCode === "number" && thrown.exitCode === 0;
+    }
+    if (!bootOk) {
+      await sandbox.kill().catch(() => undefined);
+      lease.release();
+      throw new Error(`the E2B sandbox has no writable ${E2B_WORKSPACE}`);
+    }
+    return new E2BSandboxAdapter(sandbox, sandbox.sandboxId, lease, lease.key);
   }
 
   ageMs(): number {
@@ -402,8 +441,9 @@ export class E2BSandboxAdapter implements SandboxAdapter {
     const oldLease = this.lease;
     this.sandbox = fresh;
     this.lease = lease;
+    this.apiKey = lease.key;
     // restore the old workspace into the fresh VM (silent)
-    const adapter = new E2BSandboxAdapter(fresh, fresh.sandboxId, null); // temp holder for restore ops
+    const adapter = new E2BSandboxAdapter(fresh, fresh.sandboxId, null, lease.key); // temp holder for restore ops
     try {
       await adapter.restoreSnapshot(tar);
     } finally {
@@ -436,6 +476,22 @@ export class E2BSandboxAdapter implements SandboxAdapter {
         durationMs: Date.now() - started,
       };
     } catch (err) {
+      // THE HONEST-EXIT LAW (live-observed 2026-09-21): the e2b SDK v2
+      // REJECTS commands.run on ANY non-zero exit (CommandExitError carries
+      // exitCode/stdout/stderr). A legitimate failure (npm test red, a
+      // build error) must surface as its REAL exit code + output — mapping
+      // every throw to "timeout 124, no output" lied to the studio
+      // terminal and blinded the agent's own verification commands.
+      const thrown = err as { exitCode?: number; stdout?: string; stderr?: string; error?: string };
+      if (typeof thrown.exitCode === "number") {
+        return {
+          exitCode: thrown.exitCode,
+          stdout: truncateOutput(thrown.stdout ?? ""),
+          stderr: truncateOutput(thrown.stderr ?? (thrown.error ? String(thrown.error) : "")),
+          timedOut: false,
+          durationMs: Date.now() - started,
+        };
+      }
       return {
         exitCode: 124,
         stdout: "",
