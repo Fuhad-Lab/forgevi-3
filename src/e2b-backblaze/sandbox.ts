@@ -85,9 +85,16 @@ const SNAPSHOT_EXCLUDES = ["node_modules", ".next", ".cache", "dist", ".turbo", 
 
 export function safeRelPath(input: string): string | null {
   if (typeof input !== "string" || !input.trim()) return null;
-  const clean = input.replace(/\\/g, "/").replace(/^\/+/, "");
-  if (clean.includes("..") || clean.includes("\0")) return null;
-  if (clean.startsWith(".")) return null;
+  const clean = input.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+  if (clean.includes("\0") || clean.length > 512) return null;
+  if (clean === "." || clean === "..") return null;
+  // THE DOTFILE LAW (live-observed 2026-09-21, first E2B-pool run): reject
+  // TRAVERSAL (a ".."/"." path COMPONENT) — never dotFILES. The old
+  // startsWith(".") check killed every fresh-workspace boot: the scaffold
+  // seeds .gitignore, safeRelPath(null)'d it, and the run died at spawn
+  // with "path escapes the workspace: .gitignore". Legit dotfiles
+  // (.gitignore, .env, .eslintrc, .f3-previews/) stay legal.
+  if (clean.split("/").some((part) => part === ".." || part === "." || part === "")) return null;
   return clean;
 }
 
