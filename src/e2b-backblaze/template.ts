@@ -44,11 +44,16 @@ export async function bootWorkspace(opts: {
   storage: StorageAdapter;
   workspaceKey: string | null;
   uploads: BootFile[];
+  /** THE ONE-SANDBOX LAW: a project-shared sandbox skips the snapshot
+   *  restore — getProjectSandbox already restored a fresh one, and a
+   *  LIVE sandbox must never be snapshotted over (user edits between
+   *  runs would be clobbered back to the last snapshot). */
+  skipRestore?: boolean;
 }): Promise<void> {
-  const { sandbox, storage, workspaceKey, uploads } = opts;
+  const { sandbox, storage, workspaceKey, uploads, skipRestore } = opts;
 
   // 1. persisted snapshot (never for ephemeral unbound runs)
-  if (workspaceKey) {
+  if (workspaceKey && !skipRestore) {
     const tar = await storage.loadSnapshot(workspaceKey).catch((err) => {
       throw new Error(`workspace snapshot could not be read: ${err instanceof Error ? err.message : String(err)}`);
     });

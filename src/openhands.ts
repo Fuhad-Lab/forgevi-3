@@ -1,18 +1,21 @@
 /**
  * Forgevi — the OpenHands bridge.
  *
- * The engine shell spawns ONE worker process per run
- * (`openhands/worker.py` — the real openhands-sdk agent) and relays its
- * stdout JSON lines into the run journal. Nothing here runs an agent
- * loop, picks tools, or talks to an LLM — OpenHands owns all of that.
+ * THE IN-VM AGENT LAW: the engine executes the real openhands-sdk worker
+ * (`openhands/worker.py`) INSIDE the run's sandbox — E2B microVM (streamed
+ * stdout over the commands API) or local disk (host spawn, dev engines).
+ * The engine relays the worker's stdout JSON lines into the run journal.
+ * Nothing here runs an agent loop, picks tools, or talks to an LLM —
+ * OpenHands owns all of that.
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { config } from "./config.ts";
 import { OpenRouterKeyPool, isOpenRouterQuotaSignature, type KeyPick } from "./llm/openrouter-pool.ts";
+import type { SandboxAdapter } from "./e2b-backblaze/sandbox.ts";
 
 export interface LlmConfig {
   model: string;
@@ -123,11 +126,14 @@ export interface OpenHandsRunOpts {
   llm: LlmConfig;
   maxIterations?: number;
   signal: AbortSignal;
-  /** THE E2B WORKSPACE LAW: when the run's sandbox is an E2B microVM, the
-   *  worker connects to the SAME sandbox (Sandbox.connect by id + key) and
-   *  the OpenHands agent's terminal/file tools execute INSIDE it — one
-   *  sandbox shared by the agent and the engine's studio surface. */
-  sandbox?: { id: string; apiKey: string };
+  /** THE IN-VM AGENT LAW: the run's sandbox — the OpenHands worker
+   *  executes INSIDE it. E2B: the worker script + job spec are written
+   *  into the microVM and its stdout JSON events stream back live over
+   *  the commands API (the SDK's LocalWorkspace/tmux terminal/file
+   *  editor then operate on the sandbox's OWN filesystem — the REAL
+   *  OpenHands, unmodified, inside the user's machine). Local: the
+   *  worker spawns on this host against the sandbox's local disk. */
+  sandbox: SandboxAdapter;
 }
 
 function pythonBin(): string {
@@ -142,33 +148,45 @@ function workerPath(): string {
   return path.join(engineRoot(), "openhands", "worker.py");
 }
 
-/** One OpenHands worker process — yields its events, settles honestly. */
-export async function* runOpenHands(opts: OpenHandsRunOpts): AsyncGenerator<OpenHandsEvent> {
-  const dir = await mkdtemp(path.join(tmpdir(), "forgevi-job-"));
-  const jobFile = path.join(dir, "job.json");
-  await writeFile(
-    jobFile,
-    JSON.stringify({
-      workspace: opts.workspace,
-      prompt: opts.prompt,
-      model: opts.llm.model,
-      api_key: opts.llm.apiKey,
-      ...(opts.llm.baseUrl ? { base_url: opts.llm.baseUrl } : {}),
-      max_iterations: opts.maxIterations ?? (Number(process.env.OH_MAX_ITERATIONS || 0) || 500),
-      max_output_tokens: Number(process.env.OH_MAX_OUTPUT_TOKENS || 0) || 16384,
-      ...(opts.sandbox ? { sandbox: { id: opts.sandbox.id, api_key: opts.sandbox.apiKey } } : {}),
-    }),
-  );
-  // THE JOB-FILE CLEANUP LAW: the job spec carries live credentials (the
-  // LLM key, the E2B pool key) — the worker reads it immediately and then
-  // deletes it itself (deleting here would race the worker's read).
-  const child = spawn(pythonBin(), [workerPath(), "--job", jobFile], {
-    cwd: engineRoot(),
-    env: { ...process.env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+// ── the in-VM worker install (E2B) ──────────────────────────────────────
 
-  // ── worker output plumbing ─────────────────────────────────────────
+const VM_WORKER_DIR = "/opt/forgevi";
+const VM_WORKER_PATH = `${VM_WORKER_DIR}/worker.py`;
+/** The in-VM interpreter — the baked template's venv python. Invoked
+ *  EXPLICITLY (never bare python3): the sandbox runtime's PATH belongs
+ *  to the platform (system python3 is 3.11, the SDK needs >=3.12). */
+const VM_PYTHON = process.env.OH_VM_PYTHON || "/opt/venv/bin/python3";
+
+async function sha256Hex(data: string | Buffer): Promise<string> {
+  // Buffer<ArrayBufferLike> is not a BufferSource under the current lib
+  // types — a fresh Uint8Array copy satisfies both worlds.
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
+  return Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
+}
+
+/** Ensure the VM has the current worker.py (skip the write when the
+ *  on-disk hash matches — one tiny exec beats a 20KB upload per run). */
+async function ensureVmWorker(sandbox: SandboxAdapter): Promise<void> {
+  const src = await readFile(workerPath(), "utf8");
+  const hash = await sha256Hex(src);
+  const probe = await sandbox.exec(`test "$(cat ${VM_WORKER_DIR}/.worker-hash 2>/dev/null)" = '${hash}'`);
+  if (probe.exitCode === 0) return;
+  await sandbox.exec(`mkdir -p ${VM_WORKER_DIR}`, { timeoutMs: 15_000 });
+  // the worker script + hash marker land at ABSOLUTE paths in /opt/forgevi
+  // (never the user's workspace); the job spec carries live credentials
+  // (the LLM key) and dies the moment the worker has read it.
+  await sandbox.writeVmFile(VM_WORKER_PATH, src);
+  await sandbox.writeVmFile(`${VM_WORKER_DIR}/.worker-hash`, hash);
+}
+
+/** One OpenHands worker execution — yields its events, settles honestly.
+ *
+ *  E2B: the worker runs INSIDE the microVM (streamed stdout). Local: the
+ *  worker spawns on this host. Both feed the same event queue with the
+ *  same line-buffered JSON parsing and the same honest settlement. */
+export async function* runOpenHands(opts: OpenHandsRunOpts): AsyncGenerator<OpenHandsEvent> {
+  const sandbox = opts.sandbox;
+
   const queue: OpenHandsEvent[] = [];
   let waker: (() => void) | null = null;
   let sawFinished = false;
@@ -178,61 +196,132 @@ export async function* runOpenHands(opts: OpenHandsRunOpts): AsyncGenerator<Open
 
   const wake = () => waker?.();
 
-  child.stdout.setEncoding("utf8");
-  let buffer = "";
-  child.stdout.on("data", (chunk: string) => {
-    buffer += chunk;
-    let nl: number;
-    while ((nl = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, nl).trim();
-      buffer = buffer.slice(nl + 1);
-      if (!line) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue; // never let a bad line break the run
-      }
-      if (parsed && typeof parsed === "object" && "type" in parsed) {
-        const ev = parsed as OpenHandsEvent;
-        if (ev.type === "finished") sawFinished = true;
-        queue.push(ev);
-      }
-    }
-    wake();
-  });
-
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => {
-    stderrTail = (stderrTail + chunk).slice(-4000);
-  });
-
-  child.on("error", () => {
-    closed = true;
-    wake();
-  });
-  child.on("close", (code) => {
-    exitCode = code;
-    closed = true;
-    wake();
-  });
-
-  // ── abort wiring ───────────────────────────────────────────────────
-  const onAbort = () => {
-    try {
-      child.kill("SIGTERM");
-      setTimeout(() => {
+  /** Line-buffered event feed — chunks may split lines at any byte. */
+  const makeFeeder = () => {
+    let buffer = "";
+    return (chunk: string) => {
+      buffer += chunk;
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        let parsed: unknown;
         try {
-          child.kill("SIGKILL");
+          parsed = JSON.parse(line);
         } catch {
-          /* already gone */
+          continue; // never let a bad line break the run
         }
-      }, 8000).unref();
-    } catch {
-      /* already gone */
-    }
+        if (parsed && typeof parsed === "object" && "type" in parsed) {
+          const ev = parsed as OpenHandsEvent;
+          if (ev.type === "finished") sawFinished = true;
+          queue.push(ev);
+        }
+      }
+      wake();
+    };
   };
-  opts.signal.addEventListener("abort", onAbort, { once: true });
+
+  const jobSpec = JSON.stringify({
+    workspace: opts.workspace,
+    prompt: opts.prompt,
+    model: opts.llm.model,
+    api_key: opts.llm.apiKey,
+    ...(opts.llm.baseUrl ? { base_url: opts.llm.baseUrl } : {}),
+    max_iterations: opts.maxIterations ?? (Number(process.env.OH_MAX_ITERATIONS || 0) || 500),
+    max_output_tokens: Number(process.env.OH_MAX_OUTPUT_TOKENS || 0) || 16384,
+  });
+
+  // THE COMMAND WINDOW: the in-VM worker command's timeout. A configured
+  // wall clock (FORGVI3_MAX_WALLCLOCK_MS) bounds it; unconfigured runs
+  // ride the sandbox window (the hold extends the E2B timeout to the hard
+  // cap; the run's abort signal still kills it instantly on user abort).
+  const wallClockMs =
+    config.maxWallclockMs > 0 ? config.maxWallclockMs : 50 * 60_000;
+
+  const lane = (async () => {
+    try {
+      if (sandbox.kind === "e2b") {
+        // ── THE IN-VM AGENT LAW ── the real OpenHands worker executes
+        // INSIDE the microVM; its stdout events stream back live.
+        await ensureVmWorker(sandbox);
+        const jobId = crypto.randomUUID();
+        const jobPath = `${VM_WORKER_DIR}/job-${jobId}.json`;
+        await sandbox.writeVmFile(jobPath, jobSpec);
+        const feed = makeFeeder();
+        const res = await sandbox.execStream(`${VM_PYTHON} ${VM_WORKER_PATH} --job ${jobPath}`, {
+          onStdout: feed,
+          onStderr: (chunk: string) => {
+            stderrTail = (stderrTail + chunk).slice(-4000);
+          },
+          timeoutMs: wallClockMs,
+          signal: opts.signal,
+        });
+        exitCode = res.exitCode;
+      } else {
+        // ── local lane ── the worker spawns on this host (dev engine,
+        // no E2B keys): same worker, LocalWorkspace on local disk.
+        const dir = await mkdtemp(path.join(tmpdir(), "forgevi-job-"));
+        const jobFile = path.join(dir, "job.json");
+        await writeFile(jobFile, jobSpec);
+        // THE JOB-FILE CLEANUP LAW: the worker reads it then deletes it.
+        const child = spawn(pythonBin(), [workerPath(), "--job", jobFile], {
+          cwd: engineRoot(),
+          env: { ...process.env },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        const feed = makeFeeder();
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => feed(chunk));
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk: string) => {
+          stderrTail = (stderrTail + chunk).slice(-4000);
+        });
+        child.on("error", () => {
+          closed = true;
+          wake();
+        });
+        child.on("close", (code) => {
+          exitCode = code;
+          closed = true;
+          wake();
+        });
+        const onAbort = () => {
+          try {
+            child.kill("SIGTERM");
+            setTimeout(() => {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                /* already gone */
+              }
+            }, 8000).unref();
+          } catch {
+            /* already gone */
+          }
+        };
+        opts.signal.addEventListener("abort", onAbort, { once: true });
+        // wait for child close (the settle path below handles the rest)
+        await new Promise<void>((resolve) => {
+          const poll = setInterval(() => {
+            if (closed) {
+              clearInterval(poll);
+              resolve();
+            }
+          }, 250);
+          poll.unref?.();
+        });
+        opts.signal.removeEventListener("abort", onAbort);
+        await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    } catch (err) {
+      // lane-level failure (write/exec problems) — honest settlement below
+      stderrTail = (stderrTail + `\n[lane error] ${err instanceof Error ? err.message : String(err)}`).slice(-4000);
+    } finally {
+      closed = true;
+      wake();
+    }
+  })();
 
   const wait = () =>
     new Promise<void>((resolve) => {
@@ -256,15 +345,7 @@ export async function* runOpenHands(opts: OpenHandsRunOpts): AsyncGenerator<Open
       await wait();
     }
   } finally {
-    opts.signal.removeEventListener("abort", onAbort);
-    if (!sawFinished && !closed) {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-    }
-    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    await lane.catch(() => undefined);
   }
 
   // The worker died without settling — settle honestly.

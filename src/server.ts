@@ -253,6 +253,7 @@ const server = Bun.serve({
             ? { ok: probe.ok, sdk: probe.sdk, tools: probe.tools, error: probe.error }
             : { ok: false, error: "probing" },
           sandbox: config.e2bKeys.length > 0 ? "e2b-pool" : "local",
+          e2bTemplate: config.e2bTemplate ?? "default",
           storage: config.b2 ? "backblaze-b2" : "local-disk",
           redis: redisConfigured() ? "upstash" : "none",
           e2bPool: e2bBroker.stats(),
@@ -276,6 +277,7 @@ const server = Bun.serve({
           model: providerLabel(),
           agent: probe ? { ok: probe.ok, sdk: probe.sdk, tools: probe.tools } : { ok: false, error: "probing" },
           sandbox: config.e2bKeys.length > 0 ? "e2b-pool" : "local",
+          e2bTemplate: config.e2bTemplate ?? "default",
           storage: config.b2 ? "backblaze-b2" : "local-disk",
           redis: redisConfigured() ? "upstash" : "none",
           e2bPool: e2bBroker.stats(),

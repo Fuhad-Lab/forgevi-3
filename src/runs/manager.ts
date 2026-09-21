@@ -14,6 +14,7 @@ import { verifyWorkspaceGrant } from "../grant.ts";
 import { createSandbox, type SandboxAdapter } from "../e2b-backblaze/sandbox.ts";
 import { createStorage } from "../e2b-backblaze/storage.ts";
 import { bootWorkspace, persistWorkspace } from "../e2b-backblaze/template.ts";
+import { holdProjectSandbox, releaseProjectSandbox, getProjectSandbox } from "./workspace-service.ts";
 import {
   resolveLlmConfig,
   resolveLaneLlm,
@@ -306,14 +307,28 @@ async function executeRun(
   let sandbox: SandboxAdapter | null = null;
   let outcome: OpenHandsOutcome | null = null;
   let hardError: string | null = null;
+  /** THE ONE-SANDBOX LAW: a project-bound run works in the project's
+   *  REGISTERED sandbox — the very machine the studio surface serves
+   *  (uploads, Files tab, terminal). The agent and the user share ONE
+   *  workspace; the B2 snapshot only carries state across sandbox death
+   *  (reaper / deploys), never between the agent and the studio. */
+  let sharedSandbox = false;
 
   try {
-    sandbox = await createSandbox(workspaceKey ?? `run-${view.runId.slice(0, 12)}`);
+    if (run.projectId) {
+      sandbox = await getProjectSandbox(run.projectId);
+      sharedSandbox = true;
+      holdProjectSandbox(run.projectId);
+    } else {
+      sandbox = await createSandbox(`run-${view.runId.slice(0, 12)}`);
+    }
     run.devPort = pickDevPort();
     run.sandbox = sandbox;
 
-    // SILENT boot: restore + uploads + scaffold — never in the stream
-    await bootWorkspace({ sandbox, storage: createStorage(), workspaceKey, uploads: uploadFiles });
+    // SILENT boot: restore + uploads + scaffold — never in the stream.
+    // A shared sandbox skips the restore (getProjectSandbox already
+    // restored a fresh one, and a LIVE one must never be snapshotted over).
+    await bootWorkspace({ sandbox, storage: createStorage(), workspaceKey, uploads: uploadFiles, skipRestore: sharedSandbox });
 
     // THE UPLOAD-FOLDER LAW (pre-uploaded files): uploads that landed
     // through the workspace-upload action BEFORE this run started — the
@@ -375,13 +390,10 @@ async function executeRun(
       let laneOutcome: OpenHandsOutcome | null = null;
       for await (const ev of runOpenHands({
         workspace: sandbox!.cwd,
-        // THE E2B WORKSPACE LAW: an E2B run hands the worker the sandbox
-        // connection — the OpenHands agent's tools execute INSIDE the
-        // microVM (the very same sandbox this engine's studio surface
-        // serves). Local runs keep the plain workspace path.
-        ...(sandbox!.kind === "e2b" && sandbox!.apiKey
-          ? { sandbox: { id: sandbox!.id, apiKey: sandbox!.apiKey } }
-          : {}),
+        // THE IN-VM AGENT LAW: the worker executes INSIDE the run's
+        // sandbox — the same machine the studio surface serves. E2B:
+        // streamed stdout over the commands API; local: host spawn.
+        sandbox: sandbox!,
         prompt,
         llm,
         signal: abort.signal,
@@ -466,7 +478,14 @@ async function executeRun(
       await persistWorkspace({ sandbox, storage: createStorage(), workspaceKey }).catch((err) => {
         console.error(`[run ${view.runId}] snapshot failed (workspace work is still on disk/in the sandbox): ${err instanceof Error ? err.message : String(err)}`);
       });
-      await sandbox.destroy();
+      if (sharedSandbox && run.projectId) {
+        // THE ONE-SANDBOX LAW: the project's sandbox OUTLIVES the run —
+        // the idle reaper owns its lifecycle (release re-arms the TTL).
+        // Never destroy the machine the studio surface is still serving.
+        releaseProjectSandbox(run.projectId);
+      } else {
+        await sandbox.destroy();
+      }
     }
   }
 

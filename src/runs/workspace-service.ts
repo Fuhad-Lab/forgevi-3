@@ -52,6 +52,11 @@ interface ProjectEntry {
   hardCapTimer: NodeJS.Timeout | null;
   /** In-flight eviction/migration guard — one lifecycle op at a time. */
   busy: boolean;
+  /** THE ONE-SANDBOX LAW: live runs HOLD the project sandbox — the idle
+   *  reaper, the 55-min migration, and the hard cap all defer while a
+   *  run is executing inside the machine (the E2B window is extended to
+   *  the hard cap so the VM outlives the run). */
+  holders: number;
 }
 
 const projects = new Map<string, ProjectEntry>();
@@ -88,8 +93,9 @@ function touch(entry: ProjectEntry): void {
 async function evict(sandboxId: string): Promise<void> {
   for (const [pid, entry] of projects) {
     if (entry.sandbox.id !== sandboxId) continue;
-    if (entry.busy) {
-      // a migration is in flight — re-arm the reaper for after it
+    if (entry.busy || entry.holders > 0) {
+      // a migration is in flight, or a run is executing inside the
+      // machine — re-arm the reaper for after it
       entry.evictTimer = setTimeout(() => void evict(sandboxId), 30_000);
       entry.evictTimer.unref?.();
       return;
@@ -132,7 +138,15 @@ function armLifecycle(pid: string, entry: ProjectEntry): void {
 /** The 55-minute migration — swap the entry's sandbox onto a fresh VM. */
 async function migrate(pid: string): Promise<void> {
   const entry = projects.get(pid);
-  if (!entry || entry.busy) return;
+  if (!entry || entry.busy || entry.holders > 0) {
+    // a run is executing inside the machine — deferring the swap keeps
+    // the in-VM worker alive; retry once the run releases.
+    if (entry && entry.holders > 0) {
+      entry.migrateTimer = setTimeout(() => void migrate(pid), 2 * 60_000);
+      entry.migrateTimer.unref?.();
+    }
+    return;
+  }
   entry.busy = true;
   entry.migrateTimer = null;
   try {
@@ -179,11 +193,40 @@ export async function getProjectSandbox(projectId: string): Promise<SandboxAdapt
     migrateTimer: null,
     hardCapTimer: null,
     busy: false,
+    holders: 0,
   };
   projects.set(projectId, entry);
   touch(entry);
   armLifecycle(projectId, entry);
   return sandbox;
+}
+
+// ── THE ONE-SANDBOX LAW: run holds ─────────────────────────────────
+
+/** A run started on the project's sandbox — hold it: the reaper, the
+ *  migration, and the hard cap all defer while the run is live, and the
+ *  E2B window extends to the hard cap so the VM outlives the run. */
+export function holdProjectSandbox(projectId: string): void {
+  const entry = projects.get(projectId);
+  if (!entry) return;
+  entry.holders += 1;
+  clearLifecycleTimers(entry);
+  if (entry.sandbox.kind === "e2b") {
+    // keep the machine alive through the run (bounded by the hard cap)
+    void entry.sandbox.extendTimeout(config.e2bHardCapMs + 60_000).catch(() => undefined);
+  }
+}
+
+/** The run ended — release the hold; the idle reaper re-arms (the studio
+ *  surface keeps the machine alive through normal traffic). */
+export function releaseProjectSandbox(projectId: string): void {
+  const entry = projects.get(projectId);
+  if (!entry) return;
+  entry.holders = Math.max(0, entry.holders - 1);
+  if (entry.holders === 0) {
+    touch(entry);
+    armLifecycle(projectId, entry);
+  }
 }
 
 /** The live registry (the /e2b/pool dashboard's session list). */

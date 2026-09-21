@@ -4,8 +4,8 @@
 # end-to-end. Revisit only with a gateway regression check.
 openhands-sdk==1.44.1
 openhands-tools==1.44.1
-# THE E2B WORKSPACE LAW: the worker reconnects to the run's E2B microVM
-# (Sandbox.connect) so the agent's terminal/file tools execute INSIDE the
-# sandbox. Verified against e2b 2.51.0 (commands.run cwd/timeout-seconds,
-# files.write/read, Sandbox.connect by id + api_key).
+# THE E2B TEMPLATE LANE: the engine-side e2b SDK (spawn/stream/snapshot of
+# the baked forgevi template — see e2b-template/template.ts). The agent
+# itself needs no e2b package: the worker runs INSIDE the microVM where
+# the template's /opt/venv already carries the pinned SDK.
 e2b>=2.51.0,<3

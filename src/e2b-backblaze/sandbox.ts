@@ -50,7 +50,7 @@ export interface SandboxAdapter {
   /** Absolute path inside the sandbox that is the workspace root. */
   readonly cwd: string;
   /** E2B only: the pooled API key that spawned this sandbox (the OpenHands
-   *  worker reconnects with it — THE E2B WORKSPACE LAW). Undefined locally. */
+   *  worker may reconnect with it). Undefined locally. */
   readonly apiKey?: string;
   /** Age of this sandbox in ms (the migration / hard-cap clocks). */
   ageMs(): number;
@@ -58,6 +58,23 @@ export interface SandboxAdapter {
   migrate(): Promise<void>;
 
   exec(command: string, opts?: ExecOptions): Promise<ExecResult>;
+  /** THE IN-VM AGENT LAW: stream a long-running command (the OpenHands
+   *  worker executes INSIDE the sandbox; its stdout JSON event lines
+   *  flow live through onStdout). */
+  execStream(command: string, opts?: {
+    onStdout?: (chunk: string) => void;
+    onStderr?: (chunk: string) => void;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<ExecResult>;
+  /** E2B only: write a file at an ABSOLUTE sandbox path (the worker
+   *  script + job spec land in /opt/forgevi, never the workspace).
+   * Local: writes under the workspace root when the path is inside it,
+   * else throws (dev engines run the worker on the host). */
+  writeVmFile(absPath: string, content: string | Buffer): Promise<void>;
+  /** Extend the sandbox's own lifetime (E2B setTimeout; local: no-op) —
+   *  a live run holds the machine so it outlives the run. */
+  extendTimeout(timeoutMs: number): Promise<void>;
   readTextFile(relPath: string): Promise<string>;
   readBytesFile(relPath: string): Promise<Buffer>;
   /** Write a file — text (string) or binary (Buffer). Creates parent dirs. */
@@ -179,8 +196,83 @@ export class LocalSandbox implements SandboxAdapter {
     });
   }
 
+  /** Local dev fallback for the in-VM agent lane — same spawn plumbing
+   *  with live chunk callbacks (used when the engine runs locally). */
+  async execStream(
+    command: string,
+    opts: {
+      onStdout?: (chunk: string) => void;
+      onStderr?: (chunk: string) => void;
+      timeoutMs?: number;
+      signal?: AbortSignal;
+    } = {},
+  ): Promise<ExecResult> {
+    const started = Date.now();
+    const timeoutMs = Math.max(opts.timeoutMs ?? 600_000, 1_000);
+    return await new Promise<ExecResult>((resolve) => {
+      const child = spawn("bash", ["-lc", command], { cwd: this.root });
+      let stdoutAll = "";
+      let stderrTail = "";
+      let timedOut = false;
+      let settled = false;
+      const kill = () => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      };
+      const timer = setTimeout(kill, timeoutMs);
+      const onAbort = () => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      };
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        if (stdoutAll.length < MAX_EXEC_OUTPUT * 2) stdoutAll += chunk;
+        opts.onStdout?.(chunk);
+      });
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderrTail = (stderrTail + chunk).slice(-4000);
+        opts.onStderr?.(chunk);
+      });
+      const finish = (code: number | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", onAbort);
+        resolve({
+          exitCode: opts.signal?.aborted ? 130 : timedOut ? 124 : (code ?? 0),
+          stdout: truncateOutput(stdoutAll),
+          stderr: truncateOutput(stderrTail),
+          timedOut,
+          durationMs: Date.now() - started,
+        });
+      };
+      child.on("close", finish);
+      child.on("error", (err) => {
+        stderrTail += `\n[spawn error] ${err instanceof Error ? err.message : String(err)}`;
+        finish(null);
+      });
+    });
+  }
+
   async readTextFile(relPath: string): Promise<string> {
     return await readFile(this.resolve(relPath), "utf8");
+  }
+
+  async writeVmFile(absPath: string, content: string | Buffer): Promise<void> {
+    // Local dev engines run the worker on the host — only workspace paths
+    // are meaningful here; /opt/forgevi writes are E2B-only by design.
+    const target = path.resolve(absPath);
+    if (!target.startsWith(path.resolve(this.root))) {
+      throw new Error(`writeVmFile outside the local workspace: ${absPath}`);
+    }
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, content);
+  }
+
+  async extendTimeout(_timeoutMs: number): Promise<void> {
+    // Local workspaces have no platform lifetime — a no-op by design.
   }
 
   async readBytesFile(relPath: string): Promise<Buffer> {
@@ -345,15 +437,28 @@ async function spawnPooledSandbox(template: string | undefined): Promise<{ sandb
 
 // ── E2B sandbox adapter (production) ───────────────────────────────────
 
+/** The e2b CommandHandle (background run) — the subset the engine uses. */
+type E2BCommandHandle = {
+  kill: (opts?: Record<string, unknown>) => Promise<unknown>;
+  wait: () => Promise<{ exitCode?: number; error?: string }>;
+};
+
 type E2BSandbox = {
   sandboxId: string;
   commands: {
-    run: (cmd: string, opts?: Record<string, unknown>) => Promise<{
-      exitCode: number;
-      error?: string;
-      stdout: string;
-      stderr: string;
-    }>;
+    /** Overloaded like the real SDK: `background: true` hands back a
+     *  handle (with wait/kill); every other call settles with the
+     *  command's result object. The background overload comes FIRST so
+     *  a literal `background: true` in the opts resolves to the handle. */
+    run: {
+      (cmd: string, opts: Record<string, unknown> & { background: true }): Promise<E2BCommandHandle>;
+      (cmd: string, opts?: Record<string, unknown>): Promise<{
+        exitCode: number;
+        error?: string;
+        stdout: string;
+        stderr: string;
+      }>;
+    };
   };
   files: {
     read: (p: string, opts?: Record<string, unknown>) => Promise<string | Uint8Array>;
@@ -363,6 +468,7 @@ type E2BSandbox = {
   };
   getHost: (port: number) => string;
   kill: (opts?: Record<string, unknown>) => Promise<unknown>;
+  setTimeout: (timeoutMs: number, opts?: Record<string, unknown>) => Promise<unknown>;
 };
 
 const E2B_WORKSPACE = "/workspace";
@@ -509,6 +615,86 @@ export class E2BSandboxAdapter implements SandboxAdapter {
     }
   }
 
+  /** THE IN-VM AGENT LAW: stream a long-running command's output live
+   *  (the OpenHands worker executes INSIDE this microVM; its stdout JSON
+   *  event lines flow through onStdout chunk-by-chunk). Settles with the
+   *  command's REAL exit code — a non-zero exit is a fact, not an error. */
+  async execStream(
+    command: string,
+    opts: {
+      onStdout?: (chunk: string) => void;
+      onStderr?: (chunk: string) => void;
+      timeoutMs?: number;
+      signal?: AbortSignal;
+    } = {},
+  ): Promise<ExecResult> {
+    const started = Date.now();
+    const timeoutMs = Math.max(opts.timeoutMs ?? 600_000, 1_000);
+    let stdoutAll = "";
+    let stderrTail = "";
+    try {
+      const handle = await this.sandbox.commands.run(command, {
+        cwd: E2B_WORKSPACE,
+        timeoutMs,
+        background: true,
+        onStdout: (chunk: string) => {
+          if (stdoutAll.length < MAX_EXEC_OUTPUT * 2) stdoutAll += chunk;
+          opts.onStdout?.(chunk);
+        },
+        onStderr: (chunk: string) => {
+          stderrTail = (stderrTail + chunk).slice(-4000);
+          opts.onStderr?.(chunk);
+        },
+      });
+      // abort wiring — kill the in-VM command when the run is aborted
+      const onAbort = () => {
+        void handle.kill().catch(() => undefined);
+      };
+      opts.signal?.addEventListener("abort", onAbort, { once: true });
+      let res: { exitCode?: number; error?: string };
+      try {
+        res = await handle.wait();
+      } finally {
+        opts.signal?.removeEventListener("abort", onAbort);
+      }
+      const timedOut = /timeout/i.test(res.error ?? "");
+      return {
+        exitCode: opts.signal?.aborted ? 130 : timedOut ? 124 : (res.exitCode ?? 0),
+        stdout: truncateOutput(stdoutAll),
+        stderr: truncateOutput(stderrTail),
+        timedOut,
+        durationMs: Date.now() - started,
+      };
+    } catch (err) {
+      const thrown = err as { exitCode?: number };
+      if (opts.signal?.aborted) {
+        return {
+          exitCode: 130,
+          stdout: truncateOutput(stdoutAll),
+          stderr: truncateOutput(stderrTail),
+          timedOut: false,
+          durationMs: Date.now() - started,
+        };
+      }
+      if (typeof thrown.exitCode === "number") {
+        return {
+          exitCode: thrown.exitCode,
+          stdout: truncateOutput(stdoutAll),
+          stderr: truncateOutput(stderrTail),
+          timedOut: false,
+          durationMs: Date.now() - started,
+        };
+      }
+      return {
+        exitCode: 124,
+        stdout: truncateOutput(stdoutAll),
+        stderr: truncateOutput((stderrTail + ` e2b execStream error: ${err instanceof Error ? err.message : String(err)}`).slice(-4000)),
+        timedOut: false,
+        durationMs: Date.now() - started,
+      };
+    }
+  }
+
   async readTextFile(relPath: string): Promise<string> {
     const data = await this.sandbox.files.read(this.resolve(relPath), { format: "text" });
     return typeof data === "string" ? data : Buffer.from(data).toString("utf8");
@@ -525,6 +711,25 @@ export class E2BSandboxAdapter implements SandboxAdapter {
         ? content
         : (new Uint8Array(content).buffer as ArrayBuffer);
     await this.sandbox.files.write([{ path: this.resolve(relPath), data }]);
+  }
+
+  async writeVmFile(absPath: string, content: string | Buffer): Promise<void> {
+    // Absolute-path write (the in-VM worker script + job spec live in
+    // /opt/forgevi — never inside the user's workspace).
+    const data: string | ArrayBuffer =
+      typeof content === "string"
+        ? content
+        : (new Uint8Array(content).buffer as ArrayBuffer);
+    if (!path.posix.isAbsolute(absPath) || absPath.includes("..")) {
+      throw new Error(`writeVmFile requires a clean absolute path: ${absPath}`);
+    }
+    await this.sandbox.files.write([{ path: absPath, data }]);
+  }
+
+  async extendTimeout(timeoutMs: number): Promise<void> {
+    // Keep the machine alive through a live run (the hard cap still
+    // bounds it — the holders law defers the evict while held).
+    await this.sandbox.setTimeout(Math.max(60_000, timeoutMs));
   }
 
   async listDir(relPath = "", opts: { recursive?: boolean; maxEntries?: number } = {}): Promise<SandboxFile[]> {

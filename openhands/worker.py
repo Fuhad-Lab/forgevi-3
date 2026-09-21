@@ -10,6 +10,14 @@ it only:
   - sends the task message
   - streams the conversation's events as JSON lines on stdout
 
+THE IN-VM AGENT LAW (2026-09-21): when the run's sandbox is an E2B
+microVM, the ENGINE executes this script INSIDE that microVM (streaming
+stdout over the E2B commands API) with workspace=/workspace — the SDK's
+LocalConversation/LocalWorkspace/tmux-terminal/file-editor then operate
+on the sandbox's OWN filesystem. The agent and the studio surface (files,
+terminal, uploads) share the very same machine. Local (engine-host) runs
+spawn this script directly with a local workspace directory.
+
 The engine shell (src/server.ts) spawns one worker process per run and
 relays the JSON lines into the run journal. Stdout discipline: the real
 stdout fd is captured FIRST, then sys.stdout is pointed at stderr BEFORE
@@ -23,12 +31,7 @@ Job spec (JSON file passed via --job):
     "model": "openai/<model>",         # litellm model id
     "api_key": "...",
     "base_url": "https://...",         # optional (OpenAI-compatible gateway)
-    "max_iterations": 500,             # 0 → SDK default (500)
-    "sandbox": {                       # optional — THE E2B WORKSPACE LAW:
-      "id": "<sandbox-id>",            #   when present, the agent's tools
-      "api_key": "<e2b key>"           #   execute INSIDE this E2B microVM
-    }                                  #   (Sandbox.connect — the SAME sandbox
-                                       #   the engine's studio surface serves)
+    "max_iterations": 500              # 0 → SDK default (500)
   }
 
 Event lines (one JSON object per line):
@@ -101,166 +104,6 @@ def import_openhands() -> SimpleNamespace:
         CommandResult=CommandResult,
         FileOperationResult=FileOperationResult,
     )
-
-
-# ── THE E2B WORKSPACE (the E2B mandate, worker side) ────────────────────
-#
-# A BaseWorkspace whose every operation executes INSIDE the run's E2B
-# microVM (Sandbox.connect by id + key — the SAME sandbox the engine's TS
-# adapter spawned and the studio surface serves). The OpenHands agent's
-# terminal + file editor tools call these methods; nothing touches the
-# engine host's disk.
-
-
-def build_e2b_workspace(
-    oh: SimpleNamespace,
-    spec: dict[str, Any],
-    working_dir: str,
-) -> Any:
-    """Construct an E2B-backed BaseWorkspace (sync surface over the SDK)."""
-    from openhands.sdk.workspace.base import BaseWorkspace
-
-    sandbox_id = str(spec.get("id") or "").strip()
-    api_key = str(spec.get("api_key") or "").strip()
-    if not sandbox_id or not api_key:
-        raise RuntimeError("E2B sandbox spec requires id and api_key")
-
-    from e2b import Sandbox
-
-    class E2BWorkspace(BaseWorkspace):
-        """One E2B microVM as the OpenHands workspace (sync methods)."""
-
-        _sandbox: Any = None
-
-        def _connect(self) -> Any:
-            if self._sandbox is None:
-                self._sandbox = Sandbox.connect(sandbox_id, api_key=api_key)
-            return self._sandbox
-
-        def _remote(self, rel: str | Path | None) -> str:
-            clean = str(rel or "").strip().strip("/")
-            if not clean:
-                return self.working_dir
-            if str(rel).startswith("/"):
-                return str(rel)
-            return f"{self.working_dir.rstrip('/')}/{clean}"
-
-        def __enter__(self) -> "E2BWorkspace":
-            self._connect()
-            return self
-
-        def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-            # The SANDBOX OUTLIVES the conversation: the engine owns its
-            # lifecycle (idle reaper / migration / hard cap). Never kill it
-            # here — only disconnect the client.
-            self._sandbox = None
-
-        def execute_command(
-            self,
-            command: str,
-            cwd: str | Path | None = None,
-            timeout: float = 30.0,
-        ) -> Any:
-            sbx = self._connect()
-            run_cwd = self._remote(cwd) if cwd is not None else self.working_dir
-            # THE HONEST-EXIT LAW: the e2b Python SDK RAISES
-            # CommandExitException on any non-zero exit (carrying
-            # exit_code/stdout/stderr) — a legitimate failure (a red test,
-            # a build error) must surface as its REAL exit code + output,
-            # never as a crash or a fabricated timeout.
-            try:
-                res = sbx.commands.run(command, cwd=run_cwd, timeout=float(timeout))
-                exit_code = int(getattr(res, "exit_code", 1) or 0)
-                stdout = str(getattr(res, "stdout", "") or "")
-                stderr = str(getattr(res, "stderr", "") or "")
-                error_text = str(getattr(res, "error", "") or "")
-            except Exception as exc:  # noqa: BLE001 — CommandExitException et al.
-                exit_code = int(getattr(exc, "exit_code", 1) or 1)
-                stdout = str(getattr(exc, "stdout", "") or "")
-                stderr = str(getattr(exc, "stderr", "") or getattr(exc, "error", "") or "")
-                error_text = str(getattr(exc, "error", "") or str(exc))
-            timed_out = "timeout" in error_text.lower()
-            return oh.CommandResult(
-                command=command,
-                exit_code=124 if timed_out else exit_code,
-                stdout=stdout,
-                stderr=stderr or (error_text if not stdout else ""),
-                timeout_occurred=timed_out,
-            )
-
-        def file_upload(
-            self,
-            source_path: str | Path,
-            destination_path: str | Path,
-        ) -> Any:
-            sbx = self._connect()
-            source = Path(source_path)
-            dest = self._remote(destination_path)
-            try:
-                data = source.read_bytes()
-                sbx.files.write(dest, data)
-                return oh.FileOperationResult(
-                    success=True,
-                    source_path=str(source),
-                    destination_path=str(dest),
-                    file_size=len(data),
-                )
-            except Exception as exc:  # noqa: BLE001
-                return oh.FileOperationResult(
-                    success=False,
-                    source_path=str(source),
-                    destination_path=str(dest),
-                    error=str(exc)[:500],
-                )
-
-        def file_download(
-            self,
-            source_path: str | Path,
-            destination_path: str | Path,
-        ) -> Any:
-            sbx = self._connect()
-            source = self._remote(source_path)
-            dest = Path(destination_path)
-            try:
-                data = sbx.files.read(source)
-                if isinstance(data, str):
-                    data = data.encode("utf-8")
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(bytes(data))
-                return oh.FileOperationResult(
-                    success=True,
-                    source_path=str(source),
-                    destination_path=str(dest),
-                    file_size=len(data),
-                )
-            except Exception as exc:  # noqa: BLE001
-                return oh.FileOperationResult(
-                    success=False,
-                    source_path=str(source),
-                    destination_path=str(dest),
-                    error=str(exc)[:500],
-                )
-
-        def git_changes(self, path: str | Path) -> list[Any]:
-            # Honest: git tooling over a remote microVM is not wired — the
-            # agent's terminal can run git itself; this surface returns
-            # nothing rather than lying.
-            return []
-
-        def git_diff(self, path: str | Path) -> Any:
-            from openhands.sdk.git.models import GitDiff
-
-            return GitDiff(files=[])
-
-        def pause(self) -> None:
-            pass
-
-        def resume(self) -> None:
-            pass
-
-    ws = E2BWorkspace(working_dir=working_dir)
-    ws._connect()  # fail fast — a dead sandbox settles the run honestly
-    return ws
 
 
 def _is_gateway_base_url(base_url: str | None) -> bool:
@@ -396,22 +239,16 @@ async def run_job(job: dict[str, Any]) -> int:
     oh = import_openhands()
     apply_gateway_compat_patch(oh)
 
-    sandbox_spec = job.get("sandbox")
-    if isinstance(sandbox_spec, dict) and sandbox_spec.get("id"):
-        # THE E2B WORKSPACE LAW: the agent executes INSIDE the run's E2B
-        # microVM — the same sandbox the engine's studio surface serves.
-        workspace_obj = build_e2b_workspace(oh, sandbox_spec, str(job["workspace"]))
-    else:
-        workspace = str(job["workspace"])
-        if not Path(workspace).is_dir():
-            emit({
-                "type": "finished",
-                "status": "incomplete",
-                "summary": f"workspace does not exist: {workspace}",
-                "issues": ["bad workspace"],
-            })
-            return 2
-        workspace_obj = oh.LocalWorkspace(working_dir=workspace)
+    workspace = str(job["workspace"])
+    if not Path(workspace).is_dir():
+        emit({
+            "type": "finished",
+            "status": "incomplete",
+            "summary": f"workspace does not exist: {workspace}",
+            "issues": ["bad workspace"],
+        })
+        return 2
+    workspace_obj = oh.LocalWorkspace(working_dir=workspace)
 
     model = str(job.get("model") or "")
     api_key = str(job.get("api_key") or "")
@@ -556,7 +393,7 @@ def main() -> int:
         emit({"type": "finished", "status": "incomplete", "summary": f"bad job file: {exc}", "issues": ["bad job"]})
         return 2
     # THE JOB-FILE CLEANUP LAW: the spec carries live credentials (the LLM
-    # key, the E2B pool key) — it dies the moment it has been read.
+    # key) — it dies the moment it has been read.
     with contextlib.suppress(Exception):
         job_path.unlink()
         job_path.parent.rmdir()
