@@ -110,7 +110,7 @@ export function resolveLaneLlm(modelIndex: number): { llm: LlmConfig; pick: KeyP
   }
 }
 
-export { isOpenRouterQuotaSignature };
+export { isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature };
 
 export type OpenHandsEvent =
   | { type: "thinking"; text: string }

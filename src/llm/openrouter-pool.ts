@@ -60,6 +60,17 @@ export function isOpenRouterQuotaSignature(text: string): boolean {
   );
 }
 
+/** A lane-level model failure (live-observed 2026-09-22: OpenRouter
+ *  retired the `qwen/qwen3-coder:free` slug mid-run — "This model is
+ *  unavailable for free. The paid version is available now"). A dead or
+ *  unavailable model slug is a LANE problem: rotate to the next model in
+ *  the chain instead of settling the whole run incomplete. */
+export function isOpenRouterModelUnavailableSignature(text: string): boolean {
+  return /model is unavailable|not found|does not exist|no such model|invalid model id|unavailable for free|paid version is available/i.test(
+    text,
+  );
+}
+
 export class OpenRouterKeyPool {
   private readonly nodes: KeyNode[] = [];
   private cursor = 0;

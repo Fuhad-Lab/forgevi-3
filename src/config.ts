@@ -198,13 +198,13 @@ export function loadConfig(): EngineConfig {
   const singleModel = (env.ENGINE_MODEL || "").replace(/^openai\//, "");
   if (modelChain.length === 0 && singleModel) modelChain.push(singleModel);
   if (modelChain.length === 0) {
-    // THE FREE-CHAIN DEFAULT (revised 2026-09-21): qwen3-coder leads — the
-    // best free TOOL-CALLING/agentic-coding model (OpenHands' own published
-    // trajectories run on it; strict tool-call format adherence — exactly
-    // what the agent loop needs). Nemotron ultra/lightning follow as
-    // observed-reliable fallbacks; super stays last (503-prone).
+    // THE FREE-CHAIN DEFAULT (revised 2026-09-22, live-probed: OpenRouter
+    // RETIRED qwen/qwen3-coder:free — "This model is unavailable for free.
+    // The paid version is available now" — the slug now 404s every run).
+    // The verified-free order stands: ultra (works, top-ranked), lightning
+    // (works), super (503-prone, last). The lane cascade now ALSO rotates
+    // on dead slugs, so a future retirement degrades gracefully.
     modelChain.push(
-      "qwen/qwen3-coder:free",
       "nvidia/nemotron-3-ultra-550b-a55b:free",
       "nvidia/nemotron-3.5-lightning:free",
       "nvidia/nemotron-3-super-120b-a12b:free",

@@ -26,6 +26,7 @@ import {
   resolveLaneLlm,
   runOpenHands,
   isOpenRouterQuotaSignature,
+  isOpenRouterModelUnavailableSignature,
   type LlmConfig,
   type OpenHandsEvent,
 } from "../openhands.ts";
@@ -462,15 +463,21 @@ async function executeRun(
     llmResult.pick?.reportSuccess();
 
     // THE KEY-POOL CASCADE: when the lane died with the quota/429 signature
-    // (a key's free tier is exhausted), rotate to the NEXT pooled key +
-    // next model in the chain — announced in the stream, never silent.
+    // (a key's free tier is exhausted) OR the model-unavailable signature
+    // (a retired/dead slug — live-observed: OpenRouter retired
+    // qwen3-coder:free mid-run), rotate to the NEXT pooled key + next
+    // model in the chain — announced in the stream, never silent.
     // The NVIDIA NIM lane remains the final failover when configured.
     if (outcome && !abort.signal.aborted) {
-      const signature = `${outcome.summary} ${outcome.remainingIssues.join(" ")}`;
-      let quotaHit = outcome.status === "incomplete" && isOpenRouterQuotaSignature(signature);
+      const rotatable = (o: OpenHandsOutcome | null): boolean => {
+        if (!o || o.status !== "incomplete") return false;
+        const signature = `${o.summary} ${o.remainingIssues.join(" ")}`;
+        return isOpenRouterQuotaSignature(signature) || isOpenRouterModelUnavailableSignature(signature);
+      };
+      let rotate = rotatable(outcome);
       let laneIdx = 1;
       while (
-        quotaHit &&
+        rotate &&
         !abort.signal.aborted &&
         laneIdx < Math.max(1, llmResult.modelChain.length)
       ) {
@@ -480,29 +487,26 @@ async function executeRun(
           type: "tool_used",
           tool: "engine",
           status: "ok",
-          detail: `OpenRouter lane exhausted (${llmResult.modelChain[laneIdx - 1] ?? "primary"}) — rotating to the next pooled key + model: ${llmResult.modelChain[laneIdx]}`,
+          detail: `OpenRouter lane failed (${llmResult.modelChain[laneIdx - 1] ?? "primary"}) — rotating to the next pooled key + model: ${llmResult.modelChain[laneIdx]}`,
         });
         outcome = await runLane(lane.llm);
         lane.pick.reportSuccess();
         laneIdx += 1;
-        quotaHit =
-          outcome !== null &&
-          outcome.status === "incomplete" &&
-          isOpenRouterQuotaSignature(`${outcome.summary} ${outcome.remainingIssues.join(" ")}`);
+        rotate = rotatable(outcome);
       }
       // the final failover lane (NVIDIA NIM) when the whole pool is dry
-      const nvidiaExhausted =
+      // or every OpenRouter slug is dead
+      const nvidiaNeeded =
         outcome &&
         !abort.signal.aborted &&
         llmResult.nvidia &&
-        outcome.status === "incomplete" &&
-        isOpenRouterQuotaSignature(`${outcome.summary} ${outcome.remainingIssues.join(" ")}`);
-      if (nvidiaExhausted && outcome && llmResult.nvidia) {
+        rotatable(outcome);
+      if (nvidiaNeeded && outcome && llmResult.nvidia) {
         emit({
           type: "tool_used",
           tool: "engine",
           status: "ok",
-          detail: "OpenRouter pool exhausted — switching this run to the NVIDIA lane",
+          detail: "OpenRouter pool unusable — switching this run to the NVIDIA lane",
         });
         outcome = await runLane(llmResult.nvidia);
       }
