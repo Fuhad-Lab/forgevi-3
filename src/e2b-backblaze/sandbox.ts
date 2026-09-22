@@ -404,12 +404,27 @@ export function reloadE2BBroker(): void {
   });
 }
 
-/** Spawn through the pool — acquire → create → rollback on failure. */
+// THE TEMPLATE-ACCESS LAW (2026-09-22 evening — the autopsy correction):
+// the 4 pooled keys span 4 DIFFERENT E2B accounts, and the forgevi
+// template is PRIVATE — only its owner account can spawn it. Every other
+// key fails with "404: template … not found" / "403: You don't have
+// access to this sandbox template" on EVERY spawn attempt, poisoning the
+// cascade (and masking the owner key's real error — the live incident's
+// "last error: 404" hid whichever failure the owner key actually hit).
+// A key whose spawn fails with one of these signatures is BLOCKED from
+// further picks until the broker rebuilds (config push / restart).
+const TEMPLATE_ACCESS_FAILURE =
+  /(?:\b40[34]\b[^\n]{0,200}\btemplate\b)|(?:\btemplate\b[^\n]{0,200}\b40[34]\b)|(?:\btemplate\b[^\n]{0,80}\bnot found\b)|(?:don'?t have access to this sandbox template)/i;
+
+/** Spawn through the pool — acquire → create → rollback on failure.
+ * THE AGGREGATE-ERROR LAW: the exhaustion message reports EVERY key's
+ * failure (the live incident showed only the LAST error — the owner
+ * key's real failure was invisible behind the no-access keys' 404s). */
 async function spawnPooledSandbox(template: string | undefined): Promise<{ sandbox: E2BSandbox; lease: Lease }> {
   const { Sandbox } = (await import("e2b")) as {
     Sandbox: { create: (opts: Record<string, unknown>) => Promise<E2BSandbox> };
   };
-  let lastError: unknown = null;
+  const failures: Array<{ key: string; error: string }> = [];
   // cascade attempts: each acquire() may hand a different (least-loaded) key
   for (let attempt = 0; attempt < Math.max(1, e2bBroker.keyCount); attempt++) {
     const lease = await e2bBroker.acquire();
@@ -422,16 +437,21 @@ async function spawnPooledSandbox(template: string | undefined): Promise<{ sandb
       });
       return { sandbox, lease };
     } catch (err) {
-      lastError = err;
       const message = err instanceof Error ? err.message : String(err);
+      failures.push({ key: lease.keyLabel, error: message.slice(0, 200) });
       if (/429|rate.?limit|too many|capacity/i.test(message)) {
         lease.report429(); // telemetry + cooldown — the cascade moves on
+      } else if (TEMPLATE_ACCESS_FAILURE.test(message)) {
+        // this key's account cannot spawn the configured (private)
+        // template — stop letting it poison every cascade round
+        lease.reportBlocked(`cannot spawn the configured template (${message.slice(0, 120)})`);
       }
       lease.release(); // rollback on failed acquisition — the seat returns
     }
   }
+  const detail = failures.map((f) => `${f.key}: ${f.error}`).join(" | ");
   throw new PoolExhaustedError(
-    `E2B spawn failed on every pooled key — last error: ${lastError instanceof Error ? lastError.message.slice(0, 300) : String(lastError)}`,
+    `E2B spawn failed on every pooled key — ${failures.length} attempt(s) failed: ${detail || "no attempts recorded"}`,
   );
 }
 

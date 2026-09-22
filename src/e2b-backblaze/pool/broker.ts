@@ -27,10 +27,17 @@ export interface KeyStats {
   total429s: number;
   exhausted: boolean;
   exhaustedUntil: number;
+  /** THE TEMPLATE-ACCESS LAW (2026-09-22): a key whose account cannot
+   * spawn the configured (private) template — "404 template not found" /
+   * "403 no access" — is blocked from further spawn attempts instead of
+   * poisoning every cascade round. null = usable. */
+  blockedReason: string | null;
 }
 
 export interface PoolStats {
   keys: number;
+  /** Keys not blocked by template-access/auth failures. */
+  usableKeys: number;
   totalSlots: number;
   usedSlots: number;
   queueDepth: number;
@@ -54,6 +61,10 @@ interface KeyNode {
   total429s: number;
   /** Cooldown after a live 429 (transient upstream pressure). */
   exhaustedUntil: number;
+  /** Permanent-for-this-config spawn failure (template access / dead
+   * auth) — the key stops competing for spawns until the broker rebuilds
+   * (config push / restart re-discovers with fresh credentials). */
+  blockedReason: string | null;
 }
 
 export interface Lease {
@@ -62,6 +73,10 @@ export interface Lease {
   release: () => void;
   /** Mark this acquisition as having hit a live 429 — cooldown + telemetry. */
   report429: () => void;
+  /** Mark this key as unable to spawn the configured template (404/403
+   * template-access or dead auth) — it stops competing until the broker
+   * rebuilds. THE TEMPLATE-ACCESS LAW. */
+  reportBlocked: (reason: string) => void;
 }
 
 export interface BrokerOptions {
@@ -102,6 +117,7 @@ export class KeyPoolBroker {
         totalSpawns: 0,
         total429s: 0,
         exhaustedUntil: 0,
+        blockedReason: null,
       });
     }
   }
@@ -110,12 +126,15 @@ export class KeyPoolBroker {
     return this.nodes.length;
   }
 
-  /** Least-loaded cascade: most open slots, expired throttle, not cooling down. */
+  /** Least-loaded cascade: most open slots, expired throttle, not cooling
+   * down, and not blocked (THE TEMPLATE-ACCESS LAW — a key that cannot
+   * spawn the configured template never wins a pick). */
   private pick(): KeyNode | null {
     let best: KeyNode | null = null;
     let bestScore = -1;
     const t = this.now();
     for (const node of this.nodes) {
+      if (node.blockedReason !== null) continue;
       if (node.exhaustedUntil > t) continue;
       const open = this.maxSlots - node.activeSlots;
       if (open <= 0) continue;
@@ -171,6 +190,10 @@ export class KeyPoolBroker {
         // short cooldown (30s) — the throttle law already spaces spawns
         node.exhaustedUntil = this.now() + 30_000;
       },
+      reportBlocked: (reason: string) => {
+        node.blockedReason = reason.slice(0, 160);
+        this.pump();
+      },
     });
   }
 
@@ -180,6 +203,17 @@ export class KeyPoolBroker {
       // THE HONEST FAILURE LAW: 0/0 slots across 0 keys, never fake execution
       throw new PoolExhaustedError(
         "E2B pool has 0/0 slots across 0 keys — set E2B_API_KEYS (or E2B_API_KEY_1..N) to activate the pool",
+      );
+    }
+    // THE ALL-BLOCKED LAW: every key is template/auth-blocked — waiting in
+    // the queue cannot help (no key will ever win a pick). Fail honestly
+    // NOW instead of burning the 120s queue timeout.
+    if (this.nodes.every((n) => n.blockedReason !== null)) {
+      const blocked = this.nodes
+        .map((n) => `${n.label}: ${n.blockedReason}`)
+        .join(" | ");
+      throw new PoolExhaustedError(
+        `E2B pool: all ${this.nodes.length} keys are blocked — ${blocked}`,
       );
     }
     // fast path: a key can take it right now (respecting the throttle) —
@@ -252,9 +286,11 @@ export class KeyPoolBroker {
       total429s: n.total429s,
       exhausted: n.exhaustedUntil > t,
       exhaustedUntil: n.exhaustedUntil,
+      blockedReason: n.blockedReason,
     }));
     return {
       keys: this.nodes.length,
+      usableKeys: this.nodes.filter((n) => n.blockedReason === null).length,
       totalSlots: this.nodes.length * this.maxSlots,
       usedSlots: this.nodes.reduce((sum, n) => sum + n.activeSlots, 0),
       queueDepth: this.waiters.length,
