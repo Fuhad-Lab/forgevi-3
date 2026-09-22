@@ -61,6 +61,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import re
 import signal
 import sys
 from pathlib import Path
@@ -133,6 +134,45 @@ def apply_gateway_compat_patch(oh: SimpleNamespace) -> None:
         oh.LocalConversation.get_llm_call_context = get_llm_call_context  # type: ignore[method-assign]
     except Exception:  # noqa: BLE001
         pass
+
+
+# ── THE DEGENERATE-FINAL GUARD (user fix 2026-09-22, live-observed: a
+# fully-successful build on nemotron-3.5-lightning ended with word-salad —
+# "The key}` part? Perhaps I should be consider that's not I've been't
+# possibly. Perhaps the system perhaps system't just system't always's…"
+# — which would land in the user's chat bubble AND the Redis conversation
+# cache, poisoning every later turn's context). Detection: abnormal
+# contraction density (English has ~40 valid contractions; degenerate
+# output mints fake ones like "been't", "system't", "always's"), extreme
+# token repetition, or a long text with zero sentence-ending punctuation.
+
+_VALID_CONTRACTIONS = {
+    "don't", "can't", "won't", "isn't", "aren't", "wasn't", "weren't",
+    "hasn't", "haven't", "hadn't", "doesn't", "didn't", "couldn't",
+    "shouldn't", "wouldn't", "mustn't", "ain't", "that's", "it's",
+    "there's", "here's", "what's", "who's", "he's", "she's", "i'm",
+    "you're", "they're", "we're", "i've", "you've", "we've", "they've",
+    "i'd", "you'd", "he'd", "she'd", "we'd", "they'd", "i'll", "you'll",
+    "we'll", "they'll", "he'll", "she'll", "it'll", "that'll", "let's",
+    "y'all", "o'clock", "ma'am", "cat's", "dog's",
+}
+
+
+def _is_degenerate_final(text: str) -> bool:
+    """True when a final message is word-salad, not a usable summary."""
+    words = re.findall(r"[A-Za-z']+", text)
+    if len(words) < 24:
+        return False  # too short to judge — treat as valid
+    uniq_ratio = len({w.lower() for w in words}) / len(words)
+    bad_contractions = sum(
+        1 for w in words if "'" in w and w.lower() not in _VALID_CONTRACTIONS
+    )
+    has_sentence_end = re.search(r"[.!?](?:\s|$)", text) is not None
+    return (
+        uniq_ratio < 0.35
+        or bad_contractions >= 4
+        or (len(text) > 200 and not has_sentence_end)
+    )
 
 
 # ── event mapping ───────────────────────────────────────────────────────
@@ -346,6 +386,12 @@ async def run_job(job: dict[str, Any]) -> int:
     with contextlib.suppress(Exception):
         await asyncio.to_thread(conversation.close)
 
+    # ── THE DEGENERATE-FINAL GUARD: a word-salad final message is discarded
+    # BEFORE anything consumes it — the nudge below then asks for a real
+    # one, and a still-degenerate nudge falls back to the honest summary.
+    if _is_degenerate_final(state["last_message"]):
+        state["last_message"] = ""
+
     # ── THE FINAL-ANSWER NUDGE (user fix 2026-09-21): the conversation can
     # legitimately end without a single agent text block (iteration cap,
     # a model that answered only in tool calls) — the old path then
@@ -366,6 +412,13 @@ async def run_job(job: dict[str, Any]) -> int:
                 await asyncio.to_thread(conversation.close)
         except Exception as exc:  # noqa: BLE001 — the nudge is best-effort
             state["errors"].append(f"final-answer nudge failed: {str(exc)[:200]}")
+
+    # ── THE DEGENERATE-FINAL GUARD, second look: the nudge's answer is
+    # still word-salad → discard it and surface the flaw honestly (the
+    # fallback summary below takes over; the cache never sees garbage).
+    if _is_degenerate_final(state["last_message"]):
+        state["errors"].append("the model's final message was degenerate (discarded)")
+        state["last_message"] = ""
 
     status_obj = getattr(conversation, "execution_status", None)
     status_str = str(getattr(status_obj, "value", status_obj) or "").lower()
