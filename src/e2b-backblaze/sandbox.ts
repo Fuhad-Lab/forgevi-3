@@ -825,11 +825,40 @@ export class E2BSandboxAdapter implements SandboxAdapter {
 
 // ── factory ────────────────────────────────────────────────────────────
 
-export async function createSandbox(workspaceKey: string): Promise<SandboxAdapter> {
-  if (config.e2bKeys.length > 0) {
-    return await E2BSandboxAdapter.create(config.e2bTemplate);
-  }
+/** The local-disk sandbox (the engine container's own filesystem). */
+async function createLocalSandbox(workspaceKey: string): Promise<LocalSandbox> {
   const dir = path.resolve(process.cwd(), "workspaces", workspaceKey.replace(/[^a-zA-Z0-9._-]/g, "_"));
   await mkdir(dir, { recursive: true });
   return new LocalSandbox(dir, `local-${workspaceKey}`);
+}
+
+// THE DEGRADED-BUILD LAW (user fix 2026-09-22, live-observed: the E2B
+// account died mid-day — first the custom template 404'd, then every key
+// returned "401 Invalid auth provider token", and every build died with
+// "E2B spawn failed on every pooled key"). A build that runs on the
+// engine's local disk — full agent, real files, B2 persistence, the
+// Redis journal — beats a build that never starts. The preview honestly
+// reports public:false (the dev server's 127.0.0.1 is not browser-
+// reachable) until E2B is alive again. PERMANENT failure signatures
+// only: dead keys (401/403) or a dead template (404) — transient 429 /
+// quota / capacity errors keep throwing (the queue handles those).
+const E2B_PERMANENT_FAILURE =
+  /401|403|invalid auth|unauthorized|forbidden|template[^.]{0,60}not found|not found[^.]{0,60}template/i;
+
+export async function createSandbox(workspaceKey: string): Promise<SandboxAdapter> {
+  if (config.e2bKeys.length > 0) {
+    try {
+      return await E2BSandboxAdapter.create(config.e2bTemplate);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (E2B_PERMANENT_FAILURE.test(message)) {
+        console.warn(
+          `[sandbox] E2B is unusable (${message.slice(0, 160)}) — THE DEGRADED-BUILD LAW: running on the local-disk sandbox (no public preview until E2B recovers)`,
+        );
+        return await createLocalSandbox(workspaceKey);
+      }
+      throw err;
+    }
+  }
+  return createLocalSandbox(workspaceKey);
 }

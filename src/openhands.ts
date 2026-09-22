@@ -14,7 +14,7 @@ import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { config } from "./config.ts";
-import { OpenRouterKeyPool, isOpenRouterQuotaSignature, type KeyPick } from "./llm/openrouter-pool.ts";
+import { OpenRouterKeyPool, isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature, type KeyPick } from "./llm/openrouter-pool.ts";
 import type { SandboxAdapter } from "./e2b-backblaze/sandbox.ts";
 
 export interface LlmConfig {
