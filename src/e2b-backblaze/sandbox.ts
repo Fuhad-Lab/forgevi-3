@@ -830,7 +830,12 @@ export class E2BSandboxAdapter implements SandboxAdapter {
 
   appUrl(port: number): string | null {
     try {
-      return this.sandbox.getHost(port);
+      // THE SCHEME LAW (2026-09-22): the SDK's getHost returns the bare
+      // host ("4171-<id>.e2b.app") — the engine's `public` verdict and the
+      // studio's `new URL(appUrl)` both require the scheme. E2B's public
+      // port URLs serve https (the SDK's own URL builders prefix it).
+      const host = this.sandbox.getHost(port);
+      return host.startsWith("http") ? host : `https://${host}`;
     } catch {
       return null;
     }
