@@ -39,6 +39,7 @@ RUN bun install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src ./src
 COPY openhands ./openhands
+COPY e2b-template ./e2b-template
 
 # Render injects PORT; the engine also honors ENGINE_PORT
 ENV ENGINE_PORT=3010
