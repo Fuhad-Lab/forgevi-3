@@ -146,6 +146,59 @@ async function b2CreateS3Key(
   return { keyId: body.applicationKeyId, appKey: body.applicationKey };
 }
 
+/** THE KEY-SWEEP LAW (live-observed 2026-09-23: 118 minted keys had
+ *  accumulated on the account — Render's ephemeral disk wipes the key
+ *  cache on every deploy, so every boot re-minted, and B2's key quota
+ *  would eventually refuse the mint and break snapshotting entirely).
+ *  After a mint, delete every OTHER key minted by this engine's naming
+ *  conventions (forgevi-s3-*, legacy agent-platform-s3*, probe debris).
+ *  Best-effort and bounded — a sweep failure NEVER blocks the bootstrap. */
+const SWEEPABLE_KEY_NAME = /^(forgevi-s3-|agent-platform-s3($|-diag)|soul-probe-)/;
+const SWEEP_MAX_SCAN = 500;
+const SWEEP_MAX_DELETE = 200;
+
+async function b2SweepStaleKeys(auth: B2Auth, keepKeyId: string): Promise<void> {
+  try {
+    let startAfter: string | null = null;
+    let scanned = 0;
+    let deleted = 0;
+    while (scanned < SWEEP_MAX_SCAN && deleted < SWEEP_MAX_DELETE) {
+      const res = await fetch(`${auth.apiUrl}/b2api/v2/b2_list_keys`, {
+        method: "POST",
+        headers: { Authorization: auth.authorizationToken, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountId: auth.accountId,
+          maxKeyCount: 100,
+          ...(startAfter ? { startApplicationKeyId: startAfter } : {}),
+        }),
+      }).catch(() => null);
+      if (!res || !res.ok) return; // best-effort
+      const body = (await res.json().catch(() => null)) as {
+        keys?: Array<{ applicationKeyId?: string; keyName?: string }>;
+      } | null;
+      const batch = body?.keys ?? [];
+      if (batch.length === 0) return;
+      scanned += batch.length;
+      for (const k of batch) {
+        if (deleted >= SWEEP_MAX_DELETE) return;
+        if (!k.applicationKeyId || k.applicationKeyId === keepKeyId) continue;
+        if (!k.keyName || !SWEEPABLE_KEY_NAME.test(k.keyName)) continue;
+        const del = await fetch(`${auth.apiUrl}/b2api/v2/b2_delete_key`, {
+          method: "POST",
+          headers: { Authorization: auth.authorizationToken, "Content-Type": "application/json" },
+          body: JSON.stringify({ applicationKeyId: k.applicationKeyId }),
+        }).catch(() => null);
+        if (del && del.ok) deleted += 1;
+      }
+      if (batch.length < 100) return;
+      startAfter = batch[batch.length - 1]?.applicationKeyId ?? null;
+      if (!startAfter) return;
+    }
+  } catch {
+    /* best-effort — never block the bootstrap */
+  }
+}
+
 /** Region discovery: S3 ListObjectsV2 probe per known region (the one that
  *  admits the bucket wins). Bounded, sequential, cached after success. */
 async function discoverRegion(creds: { accessKeyId: string; secretAccessKey: string }, bucket: string): Promise<string> {
@@ -277,6 +330,9 @@ export function resolveB2Credentials(): Promise<ResolvedB2Credentials> {
         await b2CreatePrivateBucket(auth, bucket);
       }
       const minted = await b2CreateS3Key(auth, bucket);
+      // THE KEY-SWEEP LAW — fire-and-forget: never add bootstrap latency,
+      // never fail the bootstrap because the sweep hiccuped.
+      void b2SweepStaleKeys(auth, minted.keyId).catch(() => undefined);
       const region = b2.region ?? (await discoverRegion({ accessKeyId: minted.keyId, secretAccessKey: minted.appKey }, bucket));
       await writeKeyCache({
         accountId: auth.accountId,

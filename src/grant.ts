@@ -76,9 +76,11 @@ export function verifyWorkspaceGrant(
 }
 
 /** Mint a grant — mirrors the backend's minting logic; probes and local
- *  development only. Production grants are minted by the Arcforge backend. */
+ *  development only. Production grants are minted by the Arcforge backend.
+ *  3.0 grants are MANIFEST grants: workspace:"manifest" with an empty
+ *  sandboxId (no Daytona sandbox exists for manifest projects). */
 export function mintWorkspaceGrant(
-  { projectId, sandboxId, userId }: { projectId: string; sandboxId: string; userId: string },
+  { projectId, sandboxId, userId, workspace }: { projectId: string; sandboxId: string; userId: string; workspace?: "manifest" | "sandbox" },
   { secret, ttlMs = 20 * 60_000, now = Date.now() }: { secret: string; ttlMs?: number; now?: number },
 ): string {
   const payload = {
@@ -86,6 +88,7 @@ export function mintWorkspaceGrant(
     projectId: String(projectId),
     sandboxId: String(sandboxId),
     userId: String(userId ?? "unknown"),
+    workspace: workspace ?? "manifest",
     iat: now,
     exp: now + ttlMs,
     jti: crypto.randomUUID(),
