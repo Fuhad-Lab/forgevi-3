@@ -14,6 +14,7 @@ import { verifyWorkspaceGrant } from "../grant.ts";
 import { createSandbox, type SandboxAdapter } from "../e2b-backblaze/sandbox.ts";
 import { createStorage } from "../e2b-backblaze/storage.ts";
 import { bootWorkspace, persistWorkspace } from "../e2b-backblaze/template.ts";
+import { injectSoul } from "../soul.ts";
 import {
   ensureProjectDevServer,
   holdProjectSandbox,
@@ -86,6 +87,10 @@ interface RunState {
   sessionId: string;
   workspaceKey: string | null;
   projectId: string | null;
+  /** THE SOUL LAW: the grant's HMAC-signed account id — binds the run
+   * (and its workspace's soul syncs) to the user across every project
+   * they own. */
+  userId: string | null;
   devPort: number | null;
   sandbox?: SandboxAdapter;
 }
@@ -162,6 +167,7 @@ export function startRun(input: StartRunInput): { status: number; body: Record<s
   // workspace binding — the grant IS the auth (fg1. HMAC from the backend)
   let projectId: string | null = null;
   let sandboxIdClaim: string | null = null;
+  let grantUserId: string | null = null;
   if (input.workspaceGrant) {
     const claims = verifyWorkspaceGrant(input.workspaceGrant, { secret: config.grantSecret });
     if (!claims) {
@@ -169,6 +175,7 @@ export function startRun(input: StartRunInput): { status: number; body: Record<s
     }
     projectId = claims.projectId;
     sandboxIdClaim = claims.sandboxId;
+    grantUserId = claims.userId;
   } else if (input.projectId && process.env.FORGVI3_ALLOW_UNGRANTED_PROJECTS === "1") {
     // development affordance ONLY — set the env explicitly to opt in
     projectId = input.projectId;
@@ -213,6 +220,7 @@ export function startRun(input: StartRunInput): { status: number; body: Record<s
     sessionId,
     workspaceKey: projectId ?? null,
     projectId,
+    userId: grantUserId,
     devPort: null,
   };
   runs.set(runId, run);
@@ -325,9 +333,15 @@ async function executeRun(
 
   try {
     if (run.projectId) {
-      sandbox = await getProjectSandbox(run.projectId);
+      sandbox = await getProjectSandbox(run.projectId, run.userId ?? undefined);
       sharedSandbox = true;
       holdProjectSandbox(run.projectId);
+      // THE SOUL LAW (run lane): a live sandbox that predates its first
+      // bound run gets the soul filled in — never overwritten (an
+      // in-progress agent edit is newer than the store).
+      if (run.userId) {
+        await injectSoul({ sandbox, storage: createStorage(), userId: run.userId, overwrite: false }).catch(() => undefined);
+      }
     } else {
       sandbox = await createSandbox(`run-${view.runId.slice(0, 12)}`);
     }
@@ -419,6 +433,7 @@ async function executeRun(
         ...(input.platform ? { platform: input.platform } : {}),
         devPort: run.devPort,
         uploads: uploadManifest,
+        ...(run.userId ? { soul: true } : {}),
       },
       chatHistory,
     );
@@ -515,9 +530,11 @@ async function executeRun(
     hardError = err instanceof Error ? err.message : String(err);
     console.error(`[run ${view.runId}] execution error: ${hardError}`);
   } finally {
-    // SILENT persist — the workspace survives, the stream never mentions it
+    // SILENT persist — the workspace survives, the stream never mentions it.
+    // THE SOUL LAW: run-end is the agent's final flush — its latest soul
+    // edits reach the central store here (the reaper re-pushes at teardown).
     if (sandbox) {
-      await persistWorkspace({ sandbox, storage: createStorage(), workspaceKey }).catch((err) => {
+      await persistWorkspace({ sandbox, storage: createStorage(), workspaceKey, userId: run.userId }).catch((err) => {
         console.error(`[run ${view.runId}] snapshot failed (workspace work is still on disk/in the sandbox): ${err instanceof Error ? err.message : String(err)}`);
       });
       if (sharedSandbox && run.projectId) {

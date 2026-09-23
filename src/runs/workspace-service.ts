@@ -25,6 +25,7 @@ import { config } from "../config.ts";
 import { createSandbox, safeRelPath, type SandboxAdapter, type ExecResult, type SandboxFile } from "../e2b-backblaze/sandbox.ts";
 import { persistWorkspace } from "../e2b-backblaze/template.ts";
 import { createStorage } from "../e2b-backblaze/storage.ts";
+import { injectSoul, pushSoul } from "../soul.ts";
 
 const PROJECT_ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
 
@@ -52,6 +53,12 @@ interface ProjectEntry {
   hardCapTimer: NodeJS.Timeout | null;
   /** In-flight eviction/migration guard — one lifecycle op at a time. */
   busy: boolean;
+  /** THE SOUL LAW: the account this project's workspace belongs to —
+   * remembered from the first GRANTED run (the fg1 grant carries the
+   * HMAC-signed userId). Studio-only sessions arrive without user
+   * identity; the reaper still syncs the soul at teardown whenever a
+   * prior run bound the account. */
+  userId: string | null;
   /** THE ONE-SANDBOX LAW: live runs HOLD the project sandbox — the idle
    *  reaper, the 55-min migration, and the hard cap all defer while a
    *  run is executing inside the machine (the E2B window is extended to
@@ -95,7 +102,13 @@ function touch(entry: ProjectEntry): void {
   }
 }
 
-/** THE 5-MINUTE IDLE REAPER — persist → destroy → seat freed. */
+/** THE 5-MINUTE IDLE REAPER — soul sync → persist → destroy → seat freed.
+ *
+ * THE SOUL LAW (backup loop): the account-global soul.md is extracted
+ * and pushed to the central store (B2 souls/<userId>.md) BEFORE the
+ * project tar is taken (the tar excludes the root soul.md by law). A
+ * failure anywhere in here keeps the VM alive (the data-safety law
+ * covers the soul exactly as it covers the workspace). */
 async function evict(sandboxId: string): Promise<void> {
   for (const [pid, entry] of projects) {
     if (entry.sandbox.id !== sandboxId) continue;
@@ -109,7 +122,11 @@ async function evict(sandboxId: string): Promise<void> {
     entry.busy = true;
     clearLifecycleTimers(entry);
     try {
-      await persistWorkspace({ sandbox: entry.sandbox, storage: createStorage(), workspaceKey: pid });
+      if (entry.userId) {
+        // THE SOUL BACKUP LOOP — flush the account's global memory first
+        await pushSoul({ sandbox: entry.sandbox, storage: createStorage(), userId: entry.userId });
+      }
+      await persistWorkspace({ sandbox: entry.sandbox, storage: createStorage(), workspaceKey: pid, userId: entry.userId });
     } catch (err) {
       // THE DATA-SAFETY LAW: a failed B2 upload keeps the VM alive —
       // never destroy work you haven't saved. Retry at the next touch.
@@ -180,20 +197,35 @@ async function migrate(pid: string): Promise<void> {
  * Get (or lazily create) the project's workspace sandbox. Local-disk is
  * instant (the run and the studio share the directory). E2B restores the
  * persisted snapshot on first touch.
+ *
+ * THE SOUL LAW (restore loop): when THIS call spawns the fresh VM, the
+ * account-global soul is injected at the workspace root right after the
+ * tar restore — before the agent (or the studio Files tab) ever sees the
+ * workspace. `userId` comes from a granted run; a studio-only rehydrate
+ * before any run reuses the entry's remembered account.
  */
-export async function getProjectSandbox(projectId: string): Promise<SandboxAdapter> {
+export async function getProjectSandbox(projectId: string, userId?: string): Promise<SandboxAdapter> {
   const existing = projects.get(projectId);
   if (existing) {
     touch(existing);
+    if (userId && !existing.userId) existing.userId = userId;
     return existing.sandbox;
   }
   const sandbox = await createSandbox(projectId);
+  const boundUser = userId ?? null;
   // E2B sandboxes are born empty — restore the project snapshot (silent law)
   if (sandbox.kind === "e2b") {
     const storage = createStorage();
     const tar = await storage.loadSnapshot(projectId).catch(() => null);
     if (tar && tar.length > 0) {
       await sandbox.restoreSnapshot(tar).catch(() => undefined);
+    }
+    // THE SOUL RESTORE LOOP — the global store is the truth on a fresh VM
+    // (the tar never carried a soul); a brand-new account is seeded.
+    if (boundUser) {
+      await injectSoul({ sandbox, storage, userId: boundUser, overwrite: true }).catch((err) => {
+        console.error(`[soul ${projectId}] restore injection failed (agent run will re-inject): ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+      });
     }
   }
   const entry: ProjectEntry = {
@@ -204,12 +236,26 @@ export async function getProjectSandbox(projectId: string): Promise<SandboxAdapt
     hardCapTimer: null,
     busy: false,
     holders: 0,
+    userId: boundUser,
     devPort: null,
   };
   projects.set(projectId, entry);
   touch(entry);
   armLifecycle(projectId, entry);
   return sandbox;
+}
+
+/** THE SOUL LAW — bind the project's workspace to the grant's account.
+ * Called when a granted run starts; the reaper syncs the soul at teardown
+ * for the account remembered here. */
+export function bindProjectUser(projectId: string, userId: string): void {
+  const entry = projects.get(projectId);
+  if (entry && !entry.userId) entry.userId = userId;
+}
+
+/** The project's bound account (the /e2b/pool dashboard surfaces it). */
+export function projectUserId(projectId: string): string | null {
+  return projects.get(projectId)?.userId ?? null;
 }
 
 // ── THE DEV-SERVER LAW (user fix 2026-09-21) ────────────────────────────
@@ -405,7 +451,7 @@ export function releaseProjectSandbox(projectId: string): void {
 }
 
 /** The live registry (the /e2b/pool dashboard's session list). */
-export function projectSessions(): Array<{ projectId: string; kind: "e2b" | "local"; sandboxId: string; lastUsedAt: number; ageMs: number; idleForMs: number }> {
+export function projectSessions(): Array<{ projectId: string; kind: "e2b" | "local"; sandboxId: string; lastUsedAt: number; ageMs: number; idleForMs: number; userId: string | null }> {
   const now = Date.now();
   return [...projects.entries()].map(([projectId, entry]) => ({
     projectId,
@@ -414,6 +460,7 @@ export function projectSessions(): Array<{ projectId: string; kind: "e2b" | "loc
     lastUsedAt: entry.lastUsedAt,
     ageMs: entry.sandbox.ageMs(),
     idleForMs: now - entry.lastUsedAt,
+    userId: entry.userId,
   }));
 }
 

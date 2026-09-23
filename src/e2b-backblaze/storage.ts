@@ -11,6 +11,11 @@
  * 5-minute idle reaper before any sandbox is destroyed — the DATA-SAFETY
  * LAW: a failed B2 upload keeps the sandbox alive (the caller must never
  * destroy work it could not save).
+ *
+ * THE SOUL LAW: this adapter also carries the account-global soul —
+ * `souls/<userId>.md` — the agent's cross-project memory, synced by the
+ * engine's restore/backup loops (see src/soul.ts). It is NEVER part of a
+ * project snapshot tar.
  */
 
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -22,10 +27,17 @@ export interface StorageAdapter {
   readonly kind: "b2" | "local-disk";
   saveSnapshot(key: string, tar: Buffer): Promise<void>;
   loadSnapshot(key: string): Promise<Buffer | null>;
+  /** THE SOUL LAW — the account-global agent memory (souls/<userId>.md). */
+  saveSoul(userId: string, content: string): Promise<void>;
+  loadSoul(userId: string): Promise<string | null>;
 }
 
 function snapshotKey(key: string): string {
   return `workspaces/${key.replace(/[^a-zA-Z0-9._-]/g, "_")}.tar.gz`;
+}
+
+function soulKey(userId: string): string {
+  return `souls/${userId.replace(/[^a-zA-Z0-9._-]/g, "_")}.md`;
 }
 
 // ── Backblaze B2 (S3-compatible, self-healing bootstrap) ───────────────
@@ -66,6 +78,26 @@ export function createB2Storage(): StorageAdapter {
       }
       return Buffer.from(await res.arrayBuffer());
     },
+    async saveSoul(userId: string, content: string): Promise<void> {
+      const { client, base } = await clientPromise;
+      const res = await client.fetch(`${base}/${soulKey(userId)}`, {
+        method: "PUT",
+        body: content,
+        headers: { "Content-Type": "text/markdown; charset=utf-8" },
+      });
+      if (!res.ok) {
+        throw new Error(`b2 soul put failed ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`);
+      }
+    },
+    async loadSoul(userId: string): Promise<string | null> {
+      const { client, base } = await clientPromise;
+      const res = await client.fetch(`${base}/${soulKey(userId)}`);
+      if (res.status === 404) return null;
+      if (!res.ok) {
+        throw new Error(`b2 soul get failed ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`);
+      }
+      return await res.text();
+    },
   };
 }
 
@@ -73,6 +105,7 @@ export function createB2Storage(): StorageAdapter {
 
 export function createLocalDiskStorage(): StorageAdapter {
   const dir = path.resolve(process.cwd(), "workspaces", "_snapshots");
+  const soulDir = path.join(dir, "souls");
   return {
     kind: "local-disk",
     async saveSnapshot(key: string, tar: Buffer): Promise<void> {
@@ -83,6 +116,17 @@ export function createLocalDiskStorage(): StorageAdapter {
     async loadSnapshot(key: string): Promise<Buffer | null> {
       try {
         return await readFile(path.join(dir, snapshotKey(key)));
+      } catch {
+        return null;
+      }
+    },
+    async saveSoul(userId: string, content: string): Promise<void> {
+      await mkdir(soulDir, { recursive: true });
+      await writeFile(path.join(soulDir, `${userId.replace(/[^a-zA-Z0-9._-]/g, "_")}.md`), content, "utf8");
+    },
+    async loadSoul(userId: string): Promise<string | null> {
+      try {
+        return await readFile(path.join(soulDir, `${userId.replace(/[^a-zA-Z0-9._-]/g, "_")}.md`), "utf8");
       } catch {
         return null;
       }

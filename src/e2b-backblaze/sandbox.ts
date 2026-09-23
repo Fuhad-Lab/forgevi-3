@@ -100,6 +100,32 @@ const MAX_EXEC_OUTPUT = 2_000_000; // 2 MB per stream — tool layer truncates f
 /** Snapshot excludes: rebuildable caches, never source. */
 const SNAPSHOT_EXCLUDES = ["node_modules", ".next", ".cache", "dist", ".turbo", ".npm", ".yarn"];
 
+/** THE SOUL LAW — ROOT-ANCHORED exclusion: the ROOT soul.md is the
+ *  account-global agent memory (platform state, synced out-of-band — see
+ *  src/soul.ts) and NEVER travels in a project tar. A NESTED soul.md
+ *  (e.g. docs/soul.md) is the user's own project file and STAYS in the
+ *  tar — only the `./soul.md` member form is excluded, never the bare
+ *  basename (which would eat nested files at any depth). */
+const ROOT_SNAPSHOT_EXCLUDES = ["soul.md"];
+
+/** Read a workspace's soul.md — null when absent/empty (migration helper;
+ *  the full soul law lives in src/soul.ts at the orchestration layer). */
+async function extractSoulContent(sandbox: SandboxAdapter): Promise<string | null> {
+  const exists = await sandbox.pathExists("soul.md").catch(() => false);
+  if (!exists) return null;
+  const content = await sandbox.readTextFile("soul.md").catch(() => null);
+  return content !== null && content.trim().length > 0 ? content : null;
+}
+
+/** The tar exclude argv for one snapshot — recursive cache excludes (both
+ *  the anchored and bare forms, matching at any depth) plus the
+ *  root-anchored soul excludes (anchored form ONLY). */
+function snapshotExcludeArgs(): string[] {
+  return SNAPSHOT_EXCLUDES.flatMap((e) => ["--exclude", `./${e}`, "--exclude", e]).concat(
+    ROOT_SNAPSHOT_EXCLUDES.flatMap((e) => ["--exclude", `./${e}`]),
+  );
+}
+
 export function safeRelPath(input: string): string | null {
   if (typeof input !== "string" || !input.trim()) return null;
   const clean = input.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
@@ -336,7 +362,7 @@ export class LocalSandbox implements SandboxAdapter {
   }
 
   async createSnapshot(): Promise<Buffer> {
-    const excludeArgs = SNAPSHOT_EXCLUDES.flatMap((e) => ["--exclude", e]);
+    const excludeArgs = snapshotExcludeArgs();
     const proc = spawn("tar", ["-czf", "-", ...excludeArgs, "-C", this.root, "."]);
     const chunks: Buffer[] = [];
     let total = 0;
@@ -571,8 +597,13 @@ export class E2BSandboxAdapter implements SandboxAdapter {
    * THE 55-MINUTE SEAMLESS MIGRATION — swap this adapter's handle onto a
    * fresh sandbox (snapshot → spawn → restore → swap → kill old). The
    * run/viewer never notices; the seat accounting migrates with it.
+   *
+   * THE SOUL LAW: soul.md rides the swap OUT-OF-BAND — read before the
+   * tar (which excludes it), re-written into the fresh VM after the
+   * restore. The global store is only touched at persist/eviction.
    */
   async migrate(): Promise<void> {
+    const soul = await extractSoulContent(this);
     const tar = await this.createSnapshot();
     const { sandbox: fresh, lease } = await spawnPooledSandbox(config.e2bTemplate);
     const old = this.sandbox;
@@ -584,6 +615,7 @@ export class E2BSandboxAdapter implements SandboxAdapter {
     const adapter = new E2BSandboxAdapter(fresh, fresh.sandboxId, null, lease.key); // temp holder for restore ops
     try {
       await adapter.restoreSnapshot(tar);
+      if (soul !== null) await adapter.writeFile("soul.md", soul);
     } finally {
       await old.kill().catch(() => undefined);
       oldLease?.release();
@@ -828,7 +860,7 @@ export class E2BSandboxAdapter implements SandboxAdapter {
   }
 
   async createSnapshot(): Promise<Buffer> {
-    const excludeArgs = SNAPSHOT_EXCLUDES.flatMap((e) => ["--exclude", `./${e}`, "--exclude", e]);
+    const excludeArgs = snapshotExcludeArgs();
     const res = await this.sandbox.commands.run(
       `cd ${E2B_WORKSPACE} && tar -czf /tmp/f3-snapshot.tar.gz ${excludeArgs.join(" ")} .`,
       { cwd: E2B_WORKSPACE, timeoutMs: 300_000 },

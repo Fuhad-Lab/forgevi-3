@@ -14,6 +14,7 @@
 
 import type { BootFile, SandboxAdapter } from "./sandbox.ts";
 import type { StorageAdapter } from "./storage.ts";
+import { pushSoul } from "../soul.ts";
 
 /** The starter scaffold a brand-new workspace gets (zero tokens burned). */
 export const SCAFFOLD_FILES: BootFile[] = [
@@ -71,9 +72,11 @@ export async function bootWorkspace(opts: {
     }
   }
 
-  // 3. scaffold only when still empty
+  // 3. scaffold only when still empty — soul.md is platform state (THE
+  //    SOUL LAW), never "meaningful project content": a fresh project
+  //    whose only file is the injected soul still gets its scaffold.
   const existing = await sandbox.listDir("", { maxEntries: 10 });
-  const meaningful = existing.filter((e) => !e.path.startsWith("uploads/") && e.path !== ".git");
+  const meaningful = existing.filter((e) => !e.path.startsWith("uploads/") && e.path !== ".git" && e.path !== "soul.md");
   if (meaningful.length === 0) {
     for (const file of SCAFFOLD_FILES) {
       await sandbox.writeFile(file.path, file.content);
@@ -83,15 +86,26 @@ export async function bootWorkspace(opts: {
 
 /**
  * Persist a workspace snapshot at run end — silent by law. Local-disk
- * sandboxes with local-disk storage skip it: the directory already IS
- * the persistence.
+ * sandboxes with local-disk storage skip the tar: the directory already
+ * IS the persistence.
+ *
+ * THE SOUL LAW (backup loop, run-end half): before the tar is taken (the
+ * root soul.md is excluded from it by law), the account-global soul is
+ * extracted from the workspace and pushed to the central store under the
+ * grant's userId — overwriting the account's global profile state. A run
+ * always knows its user (the fg1 grant); a missing/empty soul is a no-op
+ * (never erases the account's memory).
  */
 export async function persistWorkspace(opts: {
   sandbox: SandboxAdapter;
   storage: StorageAdapter;
   workspaceKey: string | null;
+  userId?: string | null;
 }): Promise<void> {
-  const { sandbox, storage, workspaceKey } = opts;
+  const { sandbox, storage, workspaceKey, userId } = opts;
+  if (userId) {
+    await pushSoul({ sandbox, storage, userId });
+  }
   if (!workspaceKey) return; // ephemeral unbound run — nothing persists
   if (sandbox.kind === "local" && storage.kind === "local-disk") return;
   const tar = await sandbox.createSnapshot();

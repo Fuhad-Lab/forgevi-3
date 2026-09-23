@@ -27,6 +27,9 @@ export interface TaskContext {
   platform?: string;
   devPort: number | null;
   uploads: UploadManifestEntry[];
+  /** THE SOUL LAW: a project-bound run — soul.md (the account-global
+   * memory) was injected at the workspace root before this prompt. */
+  soul?: boolean;
 }
 
 function historyBlock(chatHistory: ChatHistoryRow[]): string {
@@ -56,12 +59,27 @@ function platformBlock(devPort: number | null): string {
   return `[Platform laws — non-negotiable]\n${lines.join("\n")}`;
 }
 
+/** THE SOUL LAW — the cross-project memory contract. soul.md at the
+ *  workspace root is the USER's global agent memory (shared across all
+ *  their projects on this platform). Read it first; update it when the
+ *  run teaches something durable. It is synced by the platform — treat
+ *  it as a concise memory file, never as project documentation. */
+function soulBlock(): string {
+  return (
+    `[Global memory — soul.md]\n` +
+    `A file named soul.md sits at the workspace root: it is your persistent GLOBAL memory for this user, shared across ALL their projects on this platform. Read it BEFORE planning. It may hold their preferences, framework choices, past architecture decisions, and lessons — honour them in this run (e.g. if it says they prefer a styling approach, use it without re-asking).\n` +
+    `Before finishing, update soul.md itself (edit the file directly) with anything DURABLE this run taught you: new user preferences you observed, stack/architecture decisions that were made, and lessons from debugging. Keep it concise (it is memory, not documentation — do not log task-specific detail that another project would not care about). If nothing durable was learned, leave it unchanged.`
+  );
+}
+
 /** ONE user message: history → the new task → context → platform → acceptance → uploads. */
 export function buildTaskPrompt(ctx: TaskContext, chatHistory: ChatHistoryRow[]): string {
   const blocks: string[] = [];
 
   const history = historyBlock(chatHistory);
   if (history) blocks.push(history);
+
+  if (ctx.soul) blocks.push(soulBlock());
 
   blocks.push(`[New task]\n${ctx.objective.trim()}`);
 
