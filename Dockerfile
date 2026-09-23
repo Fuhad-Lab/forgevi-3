@@ -25,6 +25,13 @@ RUN apt-get update \
 COPY --from=oven/bun:1.2-slim /usr/local/bin/bun /usr/local/bin/bun
 RUN ln -s /usr/local/bin/bun /usr/local/bin/bunx
 
+# THE CLINE LANE (2026-09-23): the Cline CLI autonomous agent — the DEFAULT
+# in-VM agent for E2B runs AND the agent for the degraded local lane (the
+# engine container's own filesystem when every pooled E2B key is dead).
+# Platform binary — no Node runtime needed at exec; pinned to the version
+# the engine's NDJSON contract was verified against (src/cline.ts).
+RUN npm install -g cline@3.0.64
+
 WORKDIR /app
 
 # The OpenHands SDK (pinned — see requirements.txt)

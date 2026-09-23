@@ -59,7 +59,7 @@ import { loadRunEvents } from "./redis.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
 
 const VERSION = "3.2.0";
-const KERNEL = "openhands-sdk";
+const KERNEL = "cline+openhands";
 
 const ALLOWED_ORIGINS = new Set([
   "https://forgeyn.com.ng",
@@ -259,6 +259,7 @@ const server = Bun.serve({
           version: VERSION,
           kernel: KERNEL,
           model: llm.ok && llm.llm ? llm.llm.model.replace(/^openai\//, "") : llm.error,
+          agentLane: config.agentLane,
           agent: probe
             ? { ok: probe.ok, sdk: probe.sdk, tools: probe.tools, error: probe.error }
             : { ok: false, error: "probing" },
@@ -422,6 +423,7 @@ const server = Bun.serve({
             b2Configured: Boolean(config.b2),
             redisConfigured: Boolean(config.redis),
             modelChain: config.modelChain,
+            agentLane: config.agentLane,
             engineProvider: process.env.ENGINE_PROVIDER || "openrouter",
           },
         },

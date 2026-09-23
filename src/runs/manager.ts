@@ -25,12 +25,16 @@ import {
 import {
   resolveLlmConfig,
   resolveLaneLlm,
-  runOpenHands,
   isOpenRouterQuotaSignature,
   isOpenRouterModelUnavailableSignature,
   type LlmConfig,
   type OpenHandsEvent,
 } from "../openhands.ts";
+// THE AGENT-LANE LAW (2026-09-23): runAgent dispatches to the Cline CLI
+// (the new default in-VM agent) with the OpenHands worker as the automatic
+// fallback — the event vocabulary is identical, everything downstream is
+// unchanged.
+import { runAgent } from "../cline.ts";
 import { buildTaskPrompt, type ChatHistoryRow } from "../task.ts";
 import { normalizeUploads, type RawUpload } from "../uploads/uploads.ts";
 import { RunJournal, type JournalEvent } from "./journal.ts";
@@ -444,7 +448,7 @@ async function executeRun(
     const runLane = async (llm: LlmConfig): Promise<OpenHandsOutcome | null> => {
       let actions = 0;
       let laneOutcome: OpenHandsOutcome | null = null;
-      for await (const ev of runOpenHands({
+      for await (const ev of runAgent({
         workspace: sandbox!.cwd,
         // THE IN-VM AGENT LAW: the worker executes INSIDE the run's
         // sandbox — the same machine the studio surface serves. E2B:

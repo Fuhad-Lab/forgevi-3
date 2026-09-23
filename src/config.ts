@@ -181,6 +181,18 @@ export interface EngineConfig {
   maxWallclockMs: number;
   maxTokens: number;
   maxConcurrent: number;
+
+  /** THE AGENT-LANE LAW (2026-09-23): the in-VM agent runtime.
+   *   "cline" (default) — the Cline CLI headless (`--json` NDJSON +
+   *   `--auto-approve`), the npm `cline` platform binary baked into the
+   *   golden image (lazy `npm i -g cline` fallback for old sandboxes),
+   *   driven per lane with a `cline auth -p openrouter` exec (the pooled
+   *   key + the lane's model).
+   *   "openhands" — the previous generation (openhands/worker.py inside
+   *   the venv), retained as the explicit fallback and the automatic
+   *   fallback when cline is unavailable in a sandbox.
+   * Set via ENGINE_AGENT=cline|openhands. */
+  agentLane: "cline" | "openhands";
 }
 
 export function loadConfig(): EngineConfig {
@@ -264,6 +276,8 @@ export function loadConfig(): EngineConfig {
     maxWallclockMs: num(env.FORGVI3_MAX_WALLCLOCK_MS, 0),
     maxTokens: num(env.FORGVI3_MAX_TOKENS, 0),
     maxConcurrent: Math.max(1, num(env.ENGINE_MAX_CONCURRENT, 3)),
+
+    agentLane: env.ENGINE_AGENT === "openhands" ? "openhands" : "cline",
   };
 }
 

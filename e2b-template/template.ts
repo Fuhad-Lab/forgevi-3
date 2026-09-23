@@ -1,16 +1,18 @@
 /**
  * The baked E2B sandbox template for Forgevi 3.0 (e2b SDK v2 API).
  *
- * THE IN-VM AGENT LAW (2026-09-21): the REAL OpenHands agent runs INSIDE
- * this microVM. The SDK's LocalConversation asserts a LocalWorkspace and
- * its tools (tmux terminal + local file editor) execute where the worker
- * process runs — so the worker process runs HERE, in the sandbox, with
- * /workspace as its own local disk. The engine relays the worker's stdout
- * JSON events over the E2B streaming commands API.
+ * THE IN-VM AGENT LAW (2026-09-23, second generation): the REAL Cline CLI
+ * agent runs INSIDE this microVM — headless (`--json` NDJSON +
+ * `--auto-approve`), the npm package `cline` (a platform binary via
+ * optionalDependencies — no Node runtime needed at exec; node+npm only
+ * install it). The engine authenticates it per run lane (`cline auth -p
+ * openrouter` with the pooled key + chain model) and relays its stdout
+ * NDJSON into the run journal. The OpenHands venv stays baked as the
+ * automatic fallback lane (ENGINE_AGENT=openhands forces it).
  *
- * Baked: node + npm (dev servers), python3 + pip + openhands-sdk 1.44.1
- * (the agent), tmux (the SDK terminal tool's backend), ripgrep (its grep),
- * chromium (browser previews). Build once (needs E2B_API_KEY):
+ * Baked: node + npm (dev servers), the Cline CLI (the agent), python3 +
+ * openhands-sdk 1.44.1 (the fallback agent), tmux, ripgrep, chromium
+ * (browser previews). Build once (needs E2B_API_KEY):
  *
  *   E2B_API_KEY=e2b_... bun e2b-template/template.ts   # → prints the id
  *
@@ -40,6 +42,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
   && env UV_PYTHON_INSTALL_DIR=/opt/uv/python /opt/uv/bin/uv venv /opt/venv --python 3.12 \\
   && env UV_PYTHON_INSTALL_DIR=/opt/uv/python /opt/uv/bin/uv pip install --python /opt/venv/bin/python \\
     "openhands-sdk==1.44.1" "openhands-tools==1.44.1"
+
+# THE CLINE LANE (2026-09-23): the Cline CLI autonomous agent — npm package
+# "cline" (the platform binary @cline/cli-linux-x64 resolves via
+# optionalDependencies; the version pinned to the one the engine's NDJSON
+# contract was verified against). Isolated config dir at /opt/forgevi/cline
+# (never the user's workspace); the engine authenticates per run lane.
+RUN npm install -g cline@3.0.64 \\
+  && mkdir -p /opt/forgevi/cline/config \\
+  && cline --version
 
 # browser_preview support: Chromium (baked, not installed at runtime)
 RUN apt-get update && apt-get install -y --no-install-recommends \\
