@@ -51,11 +51,20 @@ export type { OpenHandsEvent, LlmConfig };
 /** The pinned CLI version — the one this contract was verified against. */
 export const CLINE_VERSION = "3.0.64";
 
-/** Isolated config dir in the VM (never the user's workspace, never $HOME —
- *  the sandbox runtime owns those). Baked by the golden image; created on
- *  demand for old-template sandboxes. */
-const VM_CLINE_DIR = "/opt/forgevi/cline";
+/** Isolated config dir in the VM — THE RUNTIME-USER LAW: E2B exec commands
+ *  run as the sandbox's unprivileged user, so everything cline writes
+ *  (config + data) must live in USER-WRITABLE space. /tmp is world-writable
+ *  and ephemeral per boot — perfect (auth is re-issued per run lane
+ *  anyway). NEVER /opt/forgevi: it is root-owned (live-verified EACCES:
+ *  mkdir '/opt/forgevi/cline/config/data'). */
+const VM_CLINE_DIR = "/tmp/forgevi-cline";
 const VM_CLINE_CONFIG = `${VM_CLINE_DIR}/config`;
+/** Lazy-install prefix for old-template sandboxes — npm's global prefix is
+ *  root-owned; a HOME prefix installs without privileges. */
+const VM_CLINE_HOME_BIN = "$HOME/.npm-global/bin/cline";
+/** The cline invocation prefix: the baked PATH binary when present, else
+ *  the lazily-installed HOME-prefix binary (old-template sandboxes). */
+const VM_CLINE_CMD = `$(command -v cline >/dev/null 2>&1 && echo cline || echo ${VM_CLINE_HOME_BIN})`;
 
 /** THE CODE-STREAM LAW cap: the file body forwarded per editor event. */
 const FILE_EVENT_CAP = 32 * 1024;
@@ -64,9 +73,10 @@ const FILE_EVENT_CAP = 32 * 1024;
 
 const clineAvailable = new WeakMap<SandboxAdapter, Promise<boolean>>();
 
-/** Whether the cline binary is usable in this sandbox. E2B: probes and (for
- *  old-template sandboxes) lazily `npm i -g cline` once. Local: host probe
- *  only (dev engines without cline fall back to the OpenHands worker). */
+/** Whether the cline binary is usable in this sandbox. E2B: probes the
+ *  baked binary and (for old-template sandboxes) lazily installs under a
+ *  HOME npm prefix once. Local: host probe only (dev engines without
+ *  cline fall back to the OpenHands worker). */
 function ensureCline(sandbox: SandboxAdapter): Promise<boolean> {
   let cached = clineAvailable.get(sandbox);
   if (!cached) {
@@ -74,12 +84,13 @@ function ensureCline(sandbox: SandboxAdapter): Promise<boolean> {
       const probe = await sandbox.exec("command -v cline", { timeoutMs: 10_000 }).catch(() => null);
       if (probe && probe.exitCode === 0) return true;
       if (sandbox.kind !== "e2b") return false; // no lazy install on dev hosts
-      // old-template sandbox: one-time lazy install (bounded; failure → fallback)
+      // old-template sandbox: one-time lazy install under a USER-WRITABLE
+      // prefix (npm -g needs root on the default prefix — live-verified).
       const install = await sandbox
-        .exec(`npm install -g cline@${CLINE_VERSION} 2>&1 | tail -n 3`, { timeoutMs: 300_000 })
+        .exec(`npm install -g --prefix "$HOME/.npm-global" cline@${CLINE_VERSION} 2>&1 | tail -n 3`, { timeoutMs: 300_000 })
         .catch(() => null);
       if (!install || install.exitCode !== 0) return false;
-      const reprobe = await sandbox.exec("command -v cline", { timeoutMs: 10_000 }).catch(() => null);
+      const reprobe = await sandbox.exec(`test -x ${VM_CLINE_HOME_BIN}`, { timeoutMs: 10_000 }).catch(() => null);
       return Boolean(reprobe && reprobe.exitCode === 0);
     })();
     clineAvailable.set(sandbox, cached);
@@ -103,8 +114,8 @@ async function clineAuth(sandbox: SandboxAdapter, llm: LlmConfig, configDir: str
   const isVanillaOpenRouter = !llm.baseUrl || /^https:\/\/openrouter\.ai\//i.test(llm.baseUrl);
   const model = bareModel(llm.model);
   const cmd = isVanillaOpenRouter
-    ? `cline auth -p openrouter -k '${llm.apiKey}' -m '${model}' --config '${configDir}'`
-    : `cline auth -p openai-compatible -k '${llm.apiKey}' -m '${model}' -b '${llm.baseUrl}' --config '${configDir}'`;
+    ? `${VM_CLINE_CMD} auth -p openrouter -k '${llm.apiKey}' -m '${model}' --config '${configDir}'`
+    : `${VM_CLINE_CMD} auth -p openai-compatible -k '${llm.apiKey}' -m '${model}' -b '${llm.baseUrl}' --config '${configDir}'`;
   const res = await sandbox.exec(cmd, { timeoutMs: 60_000 });
   if (res.exitCode !== 0) {
     throw new Error(`cline auth failed (exit ${res.exitCode}): ${(res.stdout || res.stderr || "").slice(-300)}`);
@@ -284,15 +295,18 @@ export async function* runCline(opts: ClineRunOpts): AsyncGenerator<OpenHandsEve
   const wallClockMs = config.maxWallclockMs > 0 ? config.maxWallclockMs : 50 * 60_000;
 
   const lane = (async () => {
-    // E2B: the prompt + config live under /opt/forgevi (absolute, never the
-    // user's workspace). Local dev engines: a host temp dir (the local
-    // writeVmFile is workspace-scoped by design).
+    // E2B: THE RUNTIME-USER LAW — the prompt + config live under
+    // /tmp/forgevi-cline (user-writable; /opt/forgevi is root-owned —
+    // live-verified EACCES). Local dev engines: a host temp dir.
     let promptPath: string;
     let configDir: string;
     let localDir: string | null = null;
     try {
       if (sandbox.kind === "e2b") {
-        await sandbox.exec(`mkdir -p ${VM_CLINE_DIR}`, { timeoutMs: 15_000 }).catch(() => undefined);
+        const mkdir = await sandbox.exec(`mkdir -p ${VM_CLINE_DIR}`, { timeoutMs: 15_000 }).catch(() => null);
+        if (!mkdir || mkdir.exitCode !== 0) {
+          throw new Error("cannot create the user-writable cline dir in the sandbox");
+        }
         configDir = VM_CLINE_CONFIG;
         const promptId = crypto.randomUUID();
         promptPath = `${VM_CLINE_DIR}/prompt-${promptId}.txt`;
@@ -306,8 +320,9 @@ export async function* runCline(opts: ClineRunOpts): AsyncGenerator<OpenHandsEve
       await clineAuth(sandbox, opts.llm, configDir);
       // THE PROMPT-FILE LAW: the task prompt (soul contract included) is
       // passed via command substitution — robust against quotes/newlines/size.
+      // The binary resolves to the baked PATH cline or the lazy HOME prefix.
       const runCmd =
-        `cline --json --auto-approve true -c '${opts.workspace}' --config '${configDir}' "$(cat '${promptPath}')"; ` +
+        `${VM_CLINE_CMD} --json --auto-approve true -c '${opts.workspace}' --config '${configDir}' "$(cat '${promptPath}')"; ` +
         `__rc=$?; rm -f '${promptPath}'; exit $__rc`;
       const feed = makeFeeder();
       const res = await sandbox.execStream(runCmd, {

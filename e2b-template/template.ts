@@ -46,10 +46,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
 # THE CLINE LANE (2026-09-23): the Cline CLI autonomous agent — npm package
 # "cline" (the platform binary @cline/cli-linux-x64 resolves via
 # optionalDependencies; the version pinned to the one the engine's NDJSON
-# contract was verified against). Isolated config dir at /opt/forgevi/cline
-# (never the user's workspace); the engine authenticates per run lane.
+# contract was verified against). THE RUNTIME-USER LAW: E2B exec commands run
+# as the unprivileged sandbox user — the engine keeps cline's config + data
+# under /tmp/forgevi-cline (user-writable), never /opt/forgevi (root-owned).
 RUN npm install -g cline@3.0.64 \\
-  && mkdir -p /opt/forgevi/cline/config \\
   && cline --version
 
 # browser_preview support: Chromium (baked, not installed at runtime)
