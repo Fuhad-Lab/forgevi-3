@@ -492,7 +492,12 @@ type E2BSandbox = {
 };
 
 const E2B_WORKSPACE = "/workspace";
-const E2B_SANDBOX_TIMEOUT_MS = 55 * 60_000; // soft window — the hard cap law lives in workspace-service
+// THE MIGRATION-RACE LAW (2026-09-23): the seamless migration fires at
+// e2bMigrateAtMs (default 55 min). The E2B sandbox timeout must sit
+// comfortably PAST that mark so the swap always wins the race — 59 min
+// gives the migration a 4-minute runway (snapshot → fresh spawn → restore
+// → swap → kill old). At 55/55 the server-side kill raced the swap.
+const E2B_SANDBOX_TIMEOUT_MS = 59 * 60_000;
 
 export class E2BSandboxAdapter implements SandboxAdapter {
   readonly kind = "e2b" as const;
@@ -769,15 +774,30 @@ export class E2BSandboxAdapter implements SandboxAdapter {
         if (out.length >= maxEntries) return;
         const name = typeof entry["name"] === "string" ? entry["name"] : String(entry["path"] ?? "").split("/").pop()!;
         const childRel = rel ? `${rel}/${name}` : name;
-        const isDir = entry["isDirectory"] === true || entry["isDir"] === true || entry["type"] === "directory" || entry["fileType"] === "directory";
+        // THE SDK-TYPE LAW (live-observed 2026-09-23): e2b SDK v2.51's
+        // files.list returns {name, path, type: FileType, size: bigint}
+        // where FileType's enum values are "file" | "dir" | "symlink" —
+        // "dir", NOT "directory". Matching only "directory" misclassified
+        // every directory as a file, so the workspace tree never descended
+        // into uploads/ and the studio's Files tab could not see uploaded
+        // files. BigInt sizes convert to Number for the JSON relay.
+        const rawType = entry["type"];
+        const isDir =
+          rawType === "dir" ||
+          rawType === "directory" ||
+          entry["isDirectory"] === true ||
+          entry["isDir"] === true ||
+          entry["fileType"] === "directory";
         if (isDir) {
           out.push({ path: childRel, type: "dir" });
           if (opts.recursive) await walk(`${dir}/${name}`, childRel, depth + 1);
         } else {
+          const rawSize = entry["size"];
+          const size = typeof rawSize === "number" ? rawSize : typeof rawSize === "bigint" ? Number(rawSize) : undefined;
           out.push({
             path: childRel,
             type: "file",
-            ...(typeof entry["size"] === "number" ? { size: entry["size"] } : {}),
+            ...(size !== undefined ? { size } : {}),
           });
         }
       }
