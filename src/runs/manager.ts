@@ -297,7 +297,9 @@ function journalEventFor(ev: OpenHandsEvent): JournalEvent | null {
           : {}),
       };
     case "error":
-      return { type: "tool_used", tool: "openhands", status: "error", detail: ev.error };
+      // Agent-neutral label — the error may come from either lane (cline
+      // today, the OpenHands worker as fallback).
+      return { type: "tool_used", tool: "agent", status: "error", detail: ev.error };
     case "finished":
       return null; // terminal — handled by the executor
     default:
