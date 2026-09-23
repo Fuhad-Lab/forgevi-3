@@ -47,6 +47,7 @@ import {
 } from "./runs/workspace-service.ts";
 import { e2bBroker, reloadE2BBroker } from "./e2b-backblaze/sandbox.ts";
 import { b2BootstrapStatus, resetB2Bootstrap } from "./e2b-backblaze/b2.ts";
+import { startTemplateSync, templateSyncStatus } from "./runs/template-sync.ts";
 import { redisConfigured } from "./redis.ts";
 import { loadRunEvents } from "./redis.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
@@ -309,6 +310,24 @@ const server = Bun.serve({
         return json(await poolDashboard(), 200, origin);
       }
       return json(await reconcilePool(), 200, origin);
+    }
+
+    // ── THE TEMPLATE-SYNC SURFACE (relay-key guarded) — build the forgevi
+    // template into EVERY pooled key's account (same alias), then spawn by
+    // alias so all keys' seats become usable. POST kicks off background
+    // builds; GET polls readiness and flips onto the alias when ready.
+    if (path === "/admin/template-sync" && (request.method === "POST" || request.method === "GET")) {
+      if (!config.relayKey) {
+        return json({ error: "template-sync surface not configured (ENGINE_RELAY_KEY unset)" }, 503, origin);
+      }
+      const key = request.headers.get("X-Engine-Relay-Key") ?? "";
+      if (key !== config.relayKey) {
+        return json({ error: "forbidden — relay key required" }, 403, origin);
+      }
+      if (request.method === "POST") {
+        return json(await startTemplateSync(), 200, origin);
+      }
+      return json(await templateSyncStatus(), 200, origin);
     }
 
     // ── THE CONFIG-PUSH SURFACE (relay-key guarded deploy path) ──────

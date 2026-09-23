@@ -60,7 +60,8 @@ export const forgeviTemplate = Template().fromDockerfile(DOCKERFILE);
 if (import.meta.main) {
   const info = await Template.build(forgeviTemplate, "forgevi-3", {
     onBuildLogs: (entry) => {
-      const line = `${entry.timestamp?.toISOString?.() ?? ""} [${entry.source ?? "build"}] ${entry.message ?? JSON.stringify(entry)}`;
+      const e = entry as { timestamp?: { toISOString?: () => string }; source?: string; message?: string };
+      const line = `${e.timestamp?.toISOString?.() ?? ""} [${e.source ?? "build"}] ${e.message ?? JSON.stringify(entry)}`;
       process.stdout.write(line + "\n");
     },
   });
