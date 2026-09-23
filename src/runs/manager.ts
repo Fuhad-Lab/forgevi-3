@@ -14,7 +14,7 @@ import { verifyWorkspaceGrant } from "../grant.ts";
 import { createSandbox, type SandboxAdapter } from "../e2b-backblaze/sandbox.ts";
 import { createStorage } from "../e2b-backblaze/storage.ts";
 import { bootWorkspace, persistWorkspace } from "../e2b-backblaze/template.ts";
-import { injectSoul } from "../soul.ts";
+import { syncSoulForRun } from "../soul.ts";
 import {
   ensureProjectDevServer,
   holdProjectSandbox,
@@ -336,11 +336,13 @@ async function executeRun(
       sandbox = await getProjectSandbox(run.projectId, run.userId ?? undefined);
       sharedSandbox = true;
       holdProjectSandbox(run.projectId);
-      // THE SOUL LAW (run lane): a live sandbox that predates its first
-      // bound run gets the soul filled in — never overwritten (an
-      // in-progress agent edit is newer than the store).
+      // THE SOUL LAW (run lane, PULL-MERGE-PUSH): a live sandbox that
+      // predates its first bound run gets the soul injected; one that
+      // already has a soul gets the store's unique lines MERGED in — a
+      // lesson from another project reaches this VM even while it stays
+      // live, and this VM's next push can never drop a lesson it has seen.
       if (run.userId) {
-        await injectSoul({ sandbox, storage: createStorage(), userId: run.userId, overwrite: false }).catch(() => undefined);
+        await syncSoulForRun({ sandbox, storage: createStorage(), userId: run.userId }).catch(() => undefined);
       }
     } else {
       sandbox = await createSandbox(`run-${view.runId.slice(0, 12)}`);
