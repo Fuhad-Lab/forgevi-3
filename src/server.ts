@@ -20,12 +20,18 @@
  *                           edge function (master-email gated) pushes pool
  *                           keys and service credentials; env vars always
  *                           win, the runtime file fills gaps
+ * GET  /admin/config        relay-key guarded — the runtime-config inspector:
+ *                           the persisted runtime file's keys + the live
+ *                           effective state (counts, template, chain). The
+ *                           ops migration path: config-push writes the file,
+ *                           this reads it back so the values can be lifted
+ *                           into REAL env vars (Render dashboard / API).
  *
  * CORS allowlist per the contract; OPTIONS handled. No framework — one
  * Bun.serve, one process, no message bus behind it.
  */
 
-import { config, writeRuntimeConfigFile, runtimeConfigPath, reloadEngineConfig } from "./config.ts";
+import { config, writeRuntimeConfigFile, readRuntimeConfigFile, runtimeConfigPath, reloadEngineConfig } from "./config.ts";
 import { abortRun, activeRunCount, getLlmConfig, getRunJournal, getRunView, listRunFiles, startRun, totalRunCount, findLiveRunForProject, type StartRunInput } from "./runs/manager.ts";
 import { probeOpenHands, probeOpenHandsSync, openrouterPool, reloadOpenRouterPool } from "./openhands.ts";
 import {
@@ -375,6 +381,48 @@ const server = Bun.serve({
             b2Configured: Boolean(config.b2),
             redisConfigured: Boolean(config.redis),
             modelChain: config.modelChain,
+          },
+        },
+        200,
+        origin,
+      );
+    }
+
+    // ── THE CONFIG-INSPECTOR SURFACE (relay-key guarded) ─────────────
+    // The ops migration path: POST /admin/config (the edge config-push)
+    // writes .engine-runtime-config.json; THIS reads it back so the values
+    // can be lifted into REAL env vars (Render API / dashboard) — after
+    // which env vars win at boot and the runtime file becomes a no-op
+    // backup. Same guard as the write surface: the relay key.
+    if (path === "/admin/config" && request.method === "GET") {
+      if (!config.relayKey) {
+        return json({ error: "config surface not configured (ENGINE_RELAY_KEY unset)" }, 503, origin);
+      }
+      const key = request.headers.get("X-Engine-Relay-Key") ?? "";
+      if (key !== config.relayKey) {
+        return json({ error: "forbidden — relay key required" }, 403, origin);
+      }
+      const fileValues = readRuntimeConfigFile();
+      const envSources: Record<string, boolean> = {};
+      for (const k of Object.keys(fileValues)) {
+        // env vars ALWAYS win — a key here that is also a live env var is
+        // currently overridden at boot (the migration target state)
+        envSources[k] = process.env[k] !== undefined;
+      }
+      return json(
+        {
+          ok: true,
+          runtimeConfigPath: runtimeConfigPath(),
+          runtimeValues: fileValues,
+          overriddenByEnv: envSources,
+          state: {
+            openrouterKeys: config.openrouterKeys.length,
+            e2bKeys: config.e2bKeys.length,
+            e2bTemplate: config.e2bTemplate ?? null,
+            b2Configured: Boolean(config.b2),
+            redisConfigured: Boolean(config.redis),
+            modelChain: config.modelChain,
+            engineProvider: process.env.ENGINE_PROVIDER || "openrouter",
           },
         },
         200,

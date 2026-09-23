@@ -56,6 +56,23 @@ export function runtimeConfigPath(): string {
   return RUNTIME_CONFIG_FILE;
 }
 
+/** Read the runtime config file's persisted values (the inspector surface).
+ *  Returns {} when absent/unreadable — an honest empty, not an error. */
+export function readRuntimeConfigFile(): Record<string, string> {
+  try {
+    if (!existsSync(RUNTIME_CONFIG_FILE)) return {};
+    const raw = JSON.parse(readFileSync(RUNTIME_CONFIG_FILE, "utf8")) as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof key === "string" && typeof value === "string") out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export function runtimeConfigDenylist(): string[] {
   return [...RUNTIME_CONFIG_DENYLIST];
 }
