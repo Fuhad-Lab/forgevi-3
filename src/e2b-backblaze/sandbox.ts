@@ -105,8 +105,12 @@ const SNAPSHOT_EXCLUDES = ["node_modules", ".next", ".cache", "dist", ".turbo", 
  *  src/soul.ts) and NEVER travels in a project tar. A NESTED soul.md
  *  (e.g. docs/soul.md) is the user's own project file and STAYS in the
  *  tar — only the `./soul.md` member form is excluded, never the bare
- *  basename (which would eat nested files at any depth). */
-const ROOT_SNAPSHOT_EXCLUDES = ["soul.md"];
+ *  basename (which would eat nested files at any depth).
+ *  THE SYSTEM-PROMPT LAW (2026-09-24) adds the platform's Cline rules
+ *  file: the ROOT .clinerules/forgevi-platform.md is the engine-injected
+ *  agent instruction (re-written before every run); the user's OWN
+ *  .clinerules content anywhere in the tree stays in the tar. */
+const ROOT_SNAPSHOT_EXCLUDES = ["soul.md", ".clinerules/forgevi-platform.md"];
 
 /** Read a workspace's soul.md — null when absent/empty (migration helper;
  *  the full soul law lives in src/soul.ts at the orchestration layer). */

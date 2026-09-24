@@ -43,6 +43,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { config } from "./config.ts";
+import { platformRulesMarkdown } from "./platform-law.ts";
 import type { SandboxAdapter } from "./e2b-backblaze/sandbox.ts";
 import { runOpenHands, type OpenHandsEvent, type LlmConfig, type OpenHandsRunOpts } from "./openhands.ts";
 
@@ -68,6 +69,35 @@ const VM_CLINE_CMD = `$(command -v cline >/dev/null 2>&1 && echo cline || echo $
 
 /** THE CODE-STREAM LAW cap: the file body forwarded per editor event. */
 const FILE_EVENT_CAP = 32 * 1024;
+
+// ── THE SYSTEM-PROMPT LAW (user mandate 2026-09-24) ─────────────────────
+// The platform's standing instructions (THE FINISH LAW above all: the
+// agent spins up the dev server itself when it finishes making edits)
+// ride Cline's SYSTEM PROMPT through its native workspace-rules mechanism:
+// .clinerules/forgevi-platform.md is injected into the system prompt's
+// "# Rules" section (verified against cline@3.0.64 — the built-in Cline
+// prompt, tool docs and tool surface are all preserved). Root-anchored
+// exclusion from the project tar keeps the platform's control file out of
+// the user's snapshots; the file is re-injected before every run.
+const RULES_REL_PATH = ".clinerules/forgevi-platform.md";
+
+async function ensurePlatformRules(sandbox: SandboxAdapter, workspace: string, devPort: number | null | undefined): Promise<void> {
+  const markdown = platformRulesMarkdown(devPort ?? null);
+  try {
+    if (sandbox.kind === "e2b") {
+      // E2B's files.write handles parents, but a tiny mkdir keeps the
+      // write single-shot honest even when a flat .clinerules FILE
+      // existed and was removed between runs.
+      await sandbox.exec(`mkdir -p '${workspace}/${path.posix.dirname(RULES_REL_PATH)}'`, { timeoutMs: 15_000 }).catch(() => undefined);
+      await sandbox.writeFile(RULES_REL_PATH, markdown);
+    } else {
+      await sandbox.writeFile(RULES_REL_PATH, markdown);
+    }
+  } catch {
+    // best-effort: the task prompt still carries the platform laws — a
+    // missing rules file never kills the run.
+  }
+}
 
 // ── availability probe (per sandbox, cached) ─────────────────────────────
 
@@ -245,6 +275,10 @@ export interface ClineRunOpts extends Omit<OpenHandsRunOpts, "maxIterations"> {
   /** Unused by cline (its autonomy budget is --retries + the wall clock);
    *  kept in the type for manager drop-in symmetry. */
   maxIterations?: number;
+  /** THE SYSTEM-PROMPT LAW: the run's assigned dev-server port — it rides
+   *  the platform rules file (Cline's system-prompt Rules section), never
+   *  a hardcoded engine-side start. */
+  devPort?: number | null;
 }
 
 /** One headless Cline run — yields OpenHandsEvents, settles honestly.
@@ -302,6 +336,10 @@ export async function* runCline(opts: ClineRunOpts): AsyncGenerator<OpenHandsEve
     let configDir: string;
     let localDir: string | null = null;
     try {
+      // THE SYSTEM-PROMPT LAW: the platform rules land in the WORKSPACE
+      // (before auth/run so the very first conversation turn already
+      // carries them in the system prompt).
+      await ensurePlatformRules(sandbox, opts.workspace, opts.devPort);
       if (sandbox.kind === "e2b") {
         const mkdir = await sandbox.exec(`mkdir -p ${VM_CLINE_DIR}`, { timeoutMs: 15_000 }).catch(() => null);
         if (!mkdir || mkdir.exitCode !== 0) {

@@ -16,7 +16,6 @@ import { createStorage } from "../e2b-backblaze/storage.ts";
 import { bootWorkspace, persistWorkspace } from "../e2b-backblaze/template.ts";
 import { syncSoulForRun } from "../soul.ts";
 import {
-  ensureProjectDevServer,
   holdProjectSandbox,
   releaseProjectSandbox,
   getProjectSandbox,
@@ -459,6 +458,12 @@ async function executeRun(
         prompt,
         llm,
         signal: abort.signal,
+        // THE SYSTEM-PROMPT LAW (user mandate 2026-09-24): the assigned
+        // dev-server port rides the AGENT'S SYSTEM PROMPT (Cline's
+        // .clinerules rules / the OpenHands worker's system-prompt
+        // addendum) — the agent spins the dev server up itself when it
+        // finishes making edits; the engine never hardcodes a start.
+        devPort: run.devPort,
       })) {
         if (ev.type === "finished") {
           laneOutcome = {
@@ -550,19 +555,14 @@ async function executeRun(
         // the idle reaper owns its lifecycle (release re-arms the TTL).
         // Never destroy the machine the studio surface is still serving.
         releaseProjectSandbox(run.projectId);
-        // THE POST-RUN PREVIEW LAW (user fix 2026-09-21): the preview must
-        // NOT die with the run. If the agent left a dev server running, the
-        // announcement below simply confirms it; if it did not, the engine
-        // starts one on the remembered port (best-effort, never blocks the
-        // run's terminal settle — the journal is already closed by then, so
-        // the studio learns through the preview route / restart button).
-        if (!abort.signal.aborted) {
-          void ensureProjectDevServer(run.projectId).catch((err) => {
-            console.error(
-              `[run ${view.runId}] post-run dev-server ensure failed: ${err instanceof Error ? err.message.slice(0, 300) : String(err)}`,
-            );
-          });
-        }
+        // THE SYSTEM-PROMPT LAW CUTOVER (user mandate 2026-09-24): the
+        // engine-side post-run dev-server auto-start is RETIRED — the
+        // agent now owns the dev-server start through its system prompt
+        // (THE FINISH LAW: "when you finish making edits, spin up the
+        // development server"). The engine's remaining preview surface is
+        // honest monitoring: the settle-time probe below announces a
+        // serving port, and the studio's manual Restart button
+        // (POST /workspace/:pid/dev-server) remains the fallback.
       } else {
         await sandbox.destroy();
       }

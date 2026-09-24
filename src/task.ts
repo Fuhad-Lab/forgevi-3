@@ -1,16 +1,17 @@
 /**
  * Forgevi — the task message.
  *
- * OpenHands owns the system prompt; the engine assembles exactly ONE
- * user message per run: the project's prior conversation (so the agent
- * knows the context), then the new task with its dynamic facts (app
- * name, platform, dev port, acceptance, uploads). Nothing else — no
- * custom system prompt, no iteration instructions, no finish coaching.
- *
- * THE PLATFORM LAW (user mandate 2026-09-21): the task message carries
- * the non-negotiable platform rules — Next.js (never a standalone HTML
- * deliverable), a running dev server on the assigned port, and
- * continuation of the existing workspace instead of a re-scaffold.
+ * THE SYSTEM-PROMPT LAW (user mandate 2026-09-24): the platform's
+ * standing instructions — above all THE FINISH LAW (the agent spins up
+ * the dev server when it finishes making edits) — ride the AGENT'S
+ * SYSTEM PROMPT (Cline's .clinerules rules file / the OpenHands
+ * worker's system-prompt addendum; see src/platform-law.ts). The engine
+ * assembles exactly ONE user message per run: the project's prior
+ * conversation (so the agent knows the context), then the new task with
+ * its dynamic facts (app name, platform, dev port, acceptance,
+ * uploads). The platform block below is the task-message REMINDER of
+ * the same laws the system prompt already carries — defense in depth,
+ * never a hardcoded engine-side dev-server start.
  */
 
 import { uploadsPromptBlock, type UploadManifestEntry } from "./uploads/uploads.ts";
@@ -46,7 +47,10 @@ function historyBlock(chatHistory: ChatHistoryRow[]): string {
   );
 }
 
-/** THE PLATFORM LAW — the non-negotiable rules every run carries. */
+/** THE PLATFORM-LAW REMINDER — the task-message echo of the laws the
+ *  agent's SYSTEM PROMPT already carries (src/platform-law.ts). Kept as
+ *  defense in depth: the reminder rides the fresh turn even in long
+ *  conversations where the system prompt is far upstream. */
 function platformBlock(devPort: number | null): string {
   const lines: string[] = [
     "This platform builds NEXT.JS apps — App Router + TypeScript + Tailwind CSS.",

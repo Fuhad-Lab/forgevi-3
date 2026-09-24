@@ -14,6 +14,7 @@ import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { config } from "./config.ts";
+import { platformLawText } from "./platform-law.ts";
 import { OpenRouterKeyPool, isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature, type KeyPick } from "./llm/openrouter-pool.ts";
 import type { SandboxAdapter } from "./e2b-backblaze/sandbox.ts";
 
@@ -134,6 +135,12 @@ export interface OpenHandsRunOpts {
    *  OpenHands, unmodified, inside the user's machine). Local: the
    *  worker spawns on this host against the sandbox's local disk. */
   sandbox: SandboxAdapter;
+  /** THE SYSTEM-PROMPT LAW (user mandate 2026-09-24): the run's assigned
+   *  dev-server port — the platform law text (THE FINISH LAW: the agent
+   *  spins up the dev server when it finishes making edits) rides the
+   *  worker's system prompt as an addendum, with this port baked in per
+   *  run. Dynamic facts stay dynamic — never a hardcoded engine start. */
+  devPort?: number | null;
 }
 
 function pythonBin(): string {
@@ -230,6 +237,11 @@ export async function* runOpenHands(opts: OpenHandsRunOpts): AsyncGenerator<Open
     ...(opts.llm.baseUrl ? { base_url: opts.llm.baseUrl } : {}),
     max_iterations: opts.maxIterations ?? (Number(process.env.OH_MAX_ITERATIONS || 0) || 500),
     max_output_tokens: Number(process.env.OH_MAX_OUTPUT_TOKENS || 0) || 16384,
+    // THE SYSTEM-PROMPT LAW: the platform law addendum — the worker
+    // appends it to the SDK default agent's system prompt (the default
+    // prompt is preserved, never replaced — verified against
+    // openhands-sdk 1.44.1's Agent.model_copy semantics).
+    system_addendum: platformLawText(opts.devPort ?? null),
   });
 
   // THE COMMAND WINDOW: the in-VM worker command's timeout. A configured

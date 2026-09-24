@@ -31,7 +31,9 @@ Job spec (JSON file passed via --job):
     "model": "openai/<model>",         # litellm model id
     "api_key": "...",
     "base_url": "https://...",         # optional (OpenAI-compatible gateway)
-    "max_iterations": 500              # 0 → SDK default (500)
+    "max_iterations": 500,             # 0 → SDK default (500)
+    "system_addendum": "..."           # THE SYSTEM-PROMPT LAW: appended to
+                                       # the SDK default agent's system prompt
   }
 
 Event lines (one JSON object per line):
@@ -348,6 +350,27 @@ async def run_job(job: dict[str, Any]) -> int:
     # THE mandate: one agent — the SDK's own default agent. cli_mode=True —
     # terminal + file editor + task tracker, no browser dependency.
     agent = oh.get_default_agent(llm=llm, cli_mode=True)
+
+    # ── THE SYSTEM-PROMPT LAW (user mandate 2026-09-24) ──────────────────
+    # The platform's standing instructions ride the agent's SYSTEM PROMPT
+    # as an APPENDIX to the SDK's built-in prompt — never a replacement
+    # (the built-in tool docs stay) and never a hardcoded engine-side
+    # dev-server start. Agent is a frozen pydantic model, so the combined
+    # prompt installs via model_copy — verified against openhands-sdk
+    # 1.44.1: static_system_message renders the default (registry-built)
+    # prompt when system_prompt is None, and returns the override verbatim
+    # once set; the conversation's SystemPromptEvent then carries the
+    # combination. Best-effort: a rendering failure leaves the default
+    # prompt (the task message still carries the platform laws).
+    addendum = str(job.get("system_addendum") or "").strip()
+    if addendum:
+        try:
+            base_prompt = agent.static_system_message
+            agent = agent.model_copy(
+                update={"system_prompt": base_prompt + "\n\n" + addendum}
+            )
+        except Exception:  # noqa: BLE001 — never kill the run for prompt assembly
+            pass
 
     state: dict[str, Any] = {"actions": 0, "observations": 0, "errors": [], "last_message": ""}
     conversation = oh.LocalConversation(
