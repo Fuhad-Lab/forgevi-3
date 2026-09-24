@@ -31,14 +31,14 @@ export function platformLawText(devPort: number | null): string {
   const finishLines = port
     ? [
         `1. If dependencies are not installed yet, install them first (npm install / bun install).`,
-        `2. Start the dev server in the background bound to 0.0.0.0 on port ${port}: nohup npm run dev -- -p ${port} -H 0.0.0.0 > /tmp/dev-server.log 2>&1 & (adapt the runner to the project — npm run dev / bun run dev / the framework's own dev command; NEVER bind to localhost only).`,
-        `3. Verify it answers: curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${port} must print an HTTP status (not 000). If it fails, read /tmp/dev-server.log, fix the cause, and start it again.`,
+        `2. Start the dev server DETACHED so it outlives your terminal session AND the run itself: setsid nohup npm run dev -- -p ${port} -H 0.0.0.0 > /tmp/dev-server.log 2>&1 & (adapt the runner to the project — npm run dev / bun run dev / the framework's own dev command; NEVER bind to localhost only; NEVER drop the setsid — a plain nohup child dies with the command's process group, and the preview dies with it).`,
+        `3. Verify it answers: curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${port} must print an HTTP status (not 000). If it fails, read /tmp/dev-server.log, fix the cause, and start it again (with setsid).`,
         `4. A run that ends without a reachable dev server on port ${port} is an UNFINISHED run — the user's preview will be dead.`,
       ]
     : [
         `1. If dependencies are not installed yet, install them first (npm install / bun install).`,
-        `2. Start the dev server in the background bound to 0.0.0.0 on the port assigned for this run: nohup npm run dev -- -p PORT -H 0.0.0.0 > /tmp/dev-server.log 2>&1 & (adapt the runner to the project; NEVER bind to localhost only).`,
-        `3. Verify it answers: curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:PORT must print an HTTP status (not 000). If it fails, read /tmp/dev-server.log, fix the cause, and start it again.`,
+        `2. Start the dev server DETACHED so it outlives your terminal session AND the run itself: setsid nohup npm run dev -- -p PORT -H 0.0.0.0 > /tmp/dev-server.log 2>&1 & (adapt the runner to the project; NEVER bind to localhost only; NEVER drop the setsid — a plain nohup child dies with the command's process group, and the preview dies with it).`,
+        `3. Verify it answers: curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:PORT must print an HTTP status (not 000). If it fails, read /tmp/dev-server.log, fix the cause, and start it again (with setsid).`,
         `4. A run that ends without a reachable dev server is an UNFINISHED run — the user's preview will be dead.`,
       ];
   return [

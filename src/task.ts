@@ -55,7 +55,7 @@ function platformBlock(devPort: number | null): string {
   const lines: string[] = [
     "This platform builds NEXT.JS apps — App Router + TypeScript + Tailwind CSS.",
     "If the workspace does not yet contain a Next.js app, create one first (package.json, next.config, tsconfig, src/app/). NEVER deliver the app as a standalone .html document — plain HTML files are only acceptable as assets inside public/ or as templates the Next.js app renders.",
-    "Keep the dev server RUNNING while you work and when you finish: start it in the background bound to 0.0.0.0 (for Next.js: `nohup npm run dev -- -p PORT -H 0.0.0.0 > /tmp/dev-server.log 2>&1 &`), then verify it answers with `curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:PORT`. The platform previews the app through that port — a run that ends without a reachable dev server is an unfinished run.",
+    "Keep the dev server RUNNING while you work and when you finish: start it DETACHED so it outlives the run — `setsid nohup npm run dev -- -p PORT -H 0.0.0.0 > /tmp/dev-server.log 2>&1 &` (setsid is what makes it survive: a plain nohup child dies with the command's process group and the preview dies with it), then verify it answers with `curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:PORT`. The platform previews the app through that port — a run that ends without a reachable dev server is an unfinished run.",
   ];
   if (devPort) {
     lines.push(`The dev-server port for this run is ${devPort} — bind the server to exactly that port.`);
