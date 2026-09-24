@@ -62,6 +62,10 @@ const VERSION = "3.2.0";
 const KERNEL = "cline+openhands";
 
 const ALLOWED_ORIGINS = new Set([
+  // studio.forgeyn.com — the canonical origin since the 2026-09 domain
+  // migration; the legacy forgeyn.com.ng origins stay allowed during the
+  // transition.
+  "https://studio.forgeyn.com",
   "https://forgeyn.com.ng",
   "https://www.forgeyn.com.ng",
   "http://localhost:3000",
@@ -72,7 +76,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 
 function corsHeaders(origin: string | null): Record<string, string> {
-  const allowed = origin && ALLOWED_ORIGINS.has(origin) ? origin : "https://forgeyn.com.ng";
+  const allowed = origin && ALLOWED_ORIGINS.has(origin) ? origin : "https://studio.forgeyn.com";
   return {
     "Access-Control-Allow-Origin": allowed,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
