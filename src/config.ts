@@ -249,20 +249,28 @@ export function loadConfig(): EngineConfig {
     //   1. poolside/laguna-s-2.1:free — Poolside's coding agent model
     //      (118B/8B active, 70.2% Terminal-Bench 2.1) — built for exactly
     //      this workload: multi-file agentic coding in a terminal loop.
-    //   2. thinkingmachines/inkling:free — 975B/41B-active MoE for
-    //      reasoning, coding, and tool-use systems (1M ctx).
-    //   3. nex-agi/nex-n2.5-pro:free — "goals into working, verified
-    //      outcomes" — agentic coding in a visual feedback loop.
+    //      Live-verified through Cline for 15 iterations (the upstream
+    //      throttles transiently — the lane cascade rides it out).
+    //   2. qwen/qwen3.8-27b:free — dense 27B for coding, agentic and
+    //      long-running agent tasks (262K ctx, VLM).
+    //   3. cohere/north-mini-code:free — Cohere's dedicated agentic coding
+    //      model (30B/3B active) — LIVE-VERIFIED tool calling when the
+    //      bigger upstreams are throttled.
     //   4. nvidia/nemotron-3-ultra-550b-a55b:free — the proven former
-    //      top-of-chain fallback (1M ctx). The lightning/super steps are
-    //      RETIRED from the chain: NVIDIA's free upstreams are the source
-    //      of the live-observed "Upstream timeout exceeded" lane deaths.
+    //      top-of-chain fallback (1M ctx).
+    //    REMOVED after live verification (2026-09-25): thinkingmachines/
+    //    inkling:free (403 "only available on agentic harnesses" — app-
+    //    whitelist gated, fails even through the real Cline CLI) and
+    //    nex-agi/nex-n2.5-(pro|mini):free (404 "No endpoints found" — dead
+    //    slugs). The lightning/super steps are RETIRED: NVIDIA's free
+    //    upstreams are the source of the live-observed "Upstream timeout
+    //    exceeded" lane deaths.
     // The lane cascade rotates on dead slugs and upstream timeouts, so a
     // future retirement degrades gracefully.
     modelChain.push(
       "poolside/laguna-s-2.1:free",
-      "thinkingmachines/inkling:free",
-      "nex-agi/nex-n2.5-pro:free",
+      "qwen/qwen3.8-27b:free",
+      "cohere/north-mini-code:free",
       "nvidia/nemotron-3-ultra-550b-a55b:free",
     );
   }
