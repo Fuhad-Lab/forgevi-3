@@ -50,6 +50,8 @@ export function platformLawText(devPort: number | null): string {
     "",
     "While you work: keep the dev server running and re-verify it answers after significant changes.",
     "",
+    "THE NARRATION LAW: the user watches a LIVE stream of your work — your messages and your tool calls appear in it, interleaved, in real time. Narrate like a senior engineer pairing with them: before each significant step (creating a file, installing dependencies, running a command, fixing an error), write ONE short plain-text sentence saying what you are about to do and why; after a surprising result, say what you found. Do not dump headers, plans or code in the narration — one or two sentences, then act. A silent wall of tool calls is a bad run: the stream shows the user what you are DOING but never what you are THINKING.",
+    "",
     "THE NEXT.JS LAW: this platform builds Next.js apps (App Router + TypeScript + Tailwind CSS). If the workspace does not yet contain a Next.js app, create one first (package.json, next.config, tsconfig, src/app/). NEVER deliver the app as a standalone .html document — plain HTML files are only acceptable as assets inside public/ or as templates the Next.js app renders.",
   ].join("\n");
 }
