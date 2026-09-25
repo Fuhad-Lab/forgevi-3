@@ -223,9 +223,23 @@ export function loadConfig(): EngineConfig {
     for (let i = 1; i <= 16; i++) add(env[`OPENROUTER_API_KEY_${i}`]);
     add(env.OPENROUTER_API_KEY); // legacy single-key form
   }
-  const modelChain: string[] = csv(env.ENGINE_MODELS).map((m) => m.replace(/^openai\//, ""));
+  // THE RETIRED-PRIMARY GUARD (live-observed 2026-09-25): the engine's
+  // Render service carries ENGINE_MODELS as a REAL env var (the user lifted
+  // the earlier session's list into the dashboard) — and env vars win at
+  // boot, so the stale chain (nemotron-lightning first) survived every
+  // config-push and code-default change. When the env chain's PRIMARY is a
+  // slug this platform has explicitly RETIRED, the chain's ordering is
+  // obsolete — discard it for the maintained default (a non-retired env
+  // chain still wins verbatim, minus any retired tail steps).
+  const RETIRED_MODEL_SLUGS = new Set([
+    "nvidia/nemotron-3.5-lightning:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+  ]);
+  const envChain = csv(env.ENGINE_MODELS).map((m) => m.replace(/^openai\//, ""));
+  const primaryRetired = envChain.length > 0 && RETIRED_MODEL_SLUGS.has(envChain[0]!);
+  const modelChain: string[] = primaryRetired ? [] : envChain.filter((m) => !RETIRED_MODEL_SLUGS.has(m));
   const singleModel = (env.ENGINE_MODEL || "").replace(/^openai\//, "");
-  if (modelChain.length === 0 && singleModel) modelChain.push(singleModel);
+  if (modelChain.length === 0 && singleModel && !RETIRED_MODEL_SLUGS.has(singleModel)) modelChain.push(singleModel);
   if (modelChain.length === 0) {
     // THE CAPABLE-MODEL LAW (user mandate 2026-09-25): the free chain leads
     // with DEDICATED CODING AGENT models, not general chat models — the
