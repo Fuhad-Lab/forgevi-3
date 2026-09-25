@@ -110,33 +110,37 @@ async function ensurePlatformRules(sandbox: SandboxAdapter, workspace: string, d
   }
 }
 
-// ── availability probe (per sandbox, cached) ─────────────────────────────
+// ── availability probe (per lane — NEVER cached across lanes) ────────────
 
-const clineAvailable = new WeakMap<SandboxAdapter, Promise<boolean>>();
-
-/** Whether the cline binary is usable in this sandbox. E2B: probes the
- *  baked binary and (for old-template sandboxes) lazily installs under a
- *  HOME npm prefix once. Local: host probe only (dev engines without
- *  cline fall back to the OpenHands worker). */
-function ensureCline(sandbox: SandboxAdapter): Promise<boolean> {
-  let cached = clineAvailable.get(sandbox);
-  if (!cached) {
-    cached = (async () => {
-      const probe = await sandbox.exec("command -v cline", { timeoutMs: 10_000 }).catch(() => null);
-      if (probe && probe.exitCode === 0) return true;
-      if (sandbox.kind !== "e2b") return false; // no lazy install on dev hosts
-      // old-template sandbox: one-time lazy install under a USER-WRITABLE
-      // prefix (npm -g needs root on the default prefix — live-verified).
-      const install = await sandbox
-        .exec(`npm install -g --prefix "$HOME/.npm-global" cline@${CLINE_VERSION} 2>&1 | tail -n 3`, { timeoutMs: 300_000 })
-        .catch(() => null);
-      if (!install || install.exitCode !== 0) return false;
-      const reprobe = await sandbox.exec(`test -x ${VM_CLINE_HOME_BIN}`, { timeoutMs: 10_000 }).catch(() => null);
-      return Boolean(reprobe && reprobe.exitCode === 0);
-    })();
-    clineAvailable.set(sandbox, cached);
-  }
-  return cached;
+/** THE RE-PROBE LAW (live-observed 2026-09-25, both E2E runs): the cline
+ *  binary can VANISH from the sandbox's exec view mid-run (lane 1 ran the
+ *  baked binary fine; the rotation lane's execs saw no PATH binary, no
+ *  /usr/local/bin/cline, no HOME prefix — then a later probe saw a
+ *  user-owned re-materialized symlink; the controlled experiment on a fresh
+ *  sandbox showed a stable FS, so this is an E2B pause/resume-class
+ *  filesystem quirk). The WeakMap cache lied across lanes; the probe now
+ *  runs on EVERY lane (a ~100ms exec) and self-heals by reinstalling under
+ *  the HOME prefix when the binary is gone — a rotation lane never dies on
+ *  a missing binary again. */
+async function ensureCline(sandbox: SandboxAdapter): Promise<boolean> {
+  // the layered probe: PATH lookup, the baked absolute path, the lazy prefix
+  const probe = await sandbox
+    .exec(
+      `command -v cline >/dev/null 2>&1 || test -x /usr/local/bin/cline || test -x ${VM_CLINE_HOME_BIN}`,
+      { timeoutMs: 10_000 },
+    )
+    .catch(() => null);
+  if (probe && probe.exitCode === 0) return true;
+  if (sandbox.kind !== "e2b") return false; // no lazy install on dev hosts
+  // the binary vanished (or never existed on an old-template sandbox):
+  // one lazy install under a USER-WRITABLE prefix (npm -g needs root on the
+  // default prefix — live-verified).
+  const install = await sandbox
+    .exec(`npm install -g --prefix "$HOME/.npm-global" cline@${CLINE_VERSION} 2>&1 | tail -n 3`, { timeoutMs: 300_000 })
+    .catch(() => null);
+  if (!install || install.exitCode !== 0) return false;
+  const reprobe = await sandbox.exec(`test -x ${VM_CLINE_HOME_BIN}`, { timeoutMs: 10_000 }).catch(() => null);
+  return Boolean(reprobe && reprobe.exitCode === 0);
 }
 
 // ── per-lane auth ────────────────────────────────────────────────────────

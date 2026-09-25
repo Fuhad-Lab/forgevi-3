@@ -64,9 +64,13 @@ export function isOpenRouterQuotaSignature(text: string): boolean {
  *  retired the `qwen/qwen3-coder:free` slug mid-run — "This model is
  *  unavailable for free. The paid version is available now"). A dead or
  *  unavailable model slug is a LANE problem: rotate to the next model in
- *  the chain instead of settling the whole run incomplete. */
+ *  the chain instead of settling the whole run incomplete.
+ *  THE MODEL-CONTEXT LAW (live-observed 2026-09-25): the bare /not found/
+ *  alternative over-matched — "cline binary not found" (an engine-side
+ *  infra failure) rotated the cascade through the whole chain as if every
+ *  model were dead. Every alternative now demands MODEL context. */
 export function isOpenRouterModelUnavailableSignature(text: string): boolean {
-  return /model is unavailable|not found|does not exist|no such model|invalid model id|unavailable for free|paid version is available/i.test(
+  return /model (?:is unavailable|not found|does not exist|unavailable)|no such model|invalid model id|unavailable for free|paid version is available|does not exist/i.test(
     text,
   );
 }
