@@ -58,7 +58,7 @@ import { redisConfigured } from "./redis.ts";
 import { loadRunEvents } from "./redis.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
 
-const VERSION = "3.2.0";
+const VERSION = "3.2.1";
 const KERNEL = "cline+openhands";
 
 const ALLOWED_ORIGINS = new Set([
