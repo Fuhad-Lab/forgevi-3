@@ -26,6 +26,7 @@ import {
   resolveLaneLlm,
   isOpenRouterQuotaSignature,
   isOpenRouterModelUnavailableSignature,
+  isOpenRouterUpstreamTimeoutSignature,
   type LlmConfig,
   type OpenHandsEvent,
 } from "../openhands.ts";
@@ -449,6 +450,14 @@ async function executeRun(
     const runLane = async (llm: LlmConfig): Promise<OpenHandsOutcome | null> => {
       let actions = 0;
       let laneOutcome: OpenHandsOutcome | null = null;
+      // THE HONEST-ISSUES LAW (user report 2026-09-25): a lane that dies on
+      // error events (cline's "Upstream timeout exceeded") settles with the
+      // bare finishReason ("error") as its only remaining issue — the real
+      // cause lived in the stream's error events, which the report never
+      // carried. The lane COLLECTS its error texts; the outcome carries them
+      // (honest reporting) AND the cascade signatures get to see them
+      // (rotation instead of a dead run).
+      const laneErrors: string[] = [];
       for await (const ev of runAgent({
         workspace: sandbox!.cwd,
         // THE IN-VM AGENT LAW: the worker executes INSIDE the run's
@@ -465,6 +474,9 @@ async function executeRun(
         // finishes making edits; the engine never hardcodes a start.
         devPort: run.devPort,
       })) {
+        if (ev.type === "error") {
+          laneErrors.push(ev.error.slice(0, 400));
+        }
         if (ev.type === "finished") {
           laneOutcome = {
             status: ev.status === "complete" ? "complete" : "incomplete",
@@ -473,6 +485,21 @@ async function executeRun(
             stopReason: ev.status === "complete" ? "finish" : abort.signal.aborted ? "aborted" : "openhands",
             actions,
           };
+          // THE HONEST-ISSUES LAW: merge the lane's real error texts into
+          // the outcome — a thin "error" finishReason never again hides
+          // the actual cause ("Upstream timeout exceeded").
+          if (laneOutcome.status === "incomplete" && laneErrors.length > 0 && !abort.signal.aborted) {
+            const seen = new Set(laneOutcome.remainingIssues);
+            for (const err of laneErrors) {
+              if (!seen.has(err)) {
+                laneOutcome.remainingIssues.push(err);
+                seen.add(err);
+              }
+            }
+            if (/^(no summary provided|the (cline|openhands) agent ended)/i.test(laneOutcome.summary)) {
+              laneOutcome.summary = `The agent lane failed: ${laneErrors[0]}`;
+            }
+          }
           break;
         }
         if (ev.type === "action") {
@@ -491,16 +518,23 @@ async function executeRun(
     llmResult.pick?.reportSuccess();
 
     // THE KEY-POOL CASCADE: when the lane died with the quota/429 signature
-    // (a key's free tier is exhausted) OR the model-unavailable signature
+    // (a key's free tier is exhausted), the model-unavailable signature
     // (a retired/dead slug — live-observed: OpenRouter retired
-    // qwen3-coder:free mid-run), rotate to the NEXT pooled key + next
-    // model in the chain — announced in the stream, never silent.
-    // The NVIDIA NIM lane remains the final failover when configured.
+    // qwen3-coder:free mid-run), OR the upstream-timeout signature
+    // (live-observed 2026-09-25: "Upstream timeout exceeded" — OpenRouter's
+    // own proxy deadline against a loaded free upstream; NOT an engine-set
+    // timeout), rotate to the NEXT pooled key + next model in the chain —
+    // announced in the stream, never silent. The NVIDIA NIM lane remains
+    // the final failover when configured.
     if (outcome && !abort.signal.aborted) {
       const rotatable = (o: OpenHandsOutcome | null): boolean => {
         if (!o || o.status !== "incomplete") return false;
         const signature = `${o.summary} ${o.remainingIssues.join(" ")}`;
-        return isOpenRouterQuotaSignature(signature) || isOpenRouterModelUnavailableSignature(signature);
+        return (
+          isOpenRouterQuotaSignature(signature) ||
+          isOpenRouterModelUnavailableSignature(signature) ||
+          isOpenRouterUpstreamTimeoutSignature(signature)
+        );
       };
       let rotate = rotatable(outcome);
       let laneIdx = 1;

@@ -71,6 +71,21 @@ export function isOpenRouterModelUnavailableSignature(text: string): boolean {
   );
 }
 
+/** THE UPSTREAM-TIMEOUT LAW (user report 2026-09-25, live-observed):
+ * OpenRouter itself times out waiting on a free model's upstream provider
+ * ("Upstream timeout exceeded" — NVIDIA's free endpoints under load miss
+ * OpenRouter's proxy deadline). This is NOT a timeout the engine sets —
+ * our only limits are the 50-min run wall clock and the worker's 600s
+ * per-call budget, neither of which produces this string. It is a LANE
+ * problem on that model: rotating to the next chain model (a different
+ * upstream) recovers the run instead of settling it incomplete with
+ * "Remaining (honest): error". */
+export function isOpenRouterUpstreamTimeoutSignature(text: string): boolean {
+  return /upstream timeout|timeout exceeded|upstream.*(error|unavailable|overloaded)|provider returned error|temporarily unavailable|service unavailable|overloaded/i.test(
+    text,
+  );
+}
+
 export class OpenRouterKeyPool {
   private readonly nodes: KeyNode[] = [];
   private cursor = 0;

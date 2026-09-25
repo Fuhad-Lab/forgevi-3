@@ -227,16 +227,29 @@ export function loadConfig(): EngineConfig {
   const singleModel = (env.ENGINE_MODEL || "").replace(/^openai\//, "");
   if (modelChain.length === 0 && singleModel) modelChain.push(singleModel);
   if (modelChain.length === 0) {
-    // THE FREE-CHAIN DEFAULT (revised 2026-09-22, live-probed: OpenRouter
-    // RETIRED qwen/qwen3-coder:free — "This model is unavailable for free.
-    // The paid version is available now" — the slug now 404s every run).
-    // The verified-free order stands: ultra (works, top-ranked), lightning
-    // (works), super (503-prone, last). The lane cascade now ALSO rotates
-    // on dead slugs, so a future retirement degrades gracefully.
+    // THE CAPABLE-MODEL LAW (user mandate 2026-09-25): the free chain leads
+    // with DEDICATED CODING AGENT models, not general chat models — the
+    // user's law: "code quality, tools calling and others it should be able
+    // to do." Live-probed order against the OpenRouter catalog (all $0,
+    // tools-capable):
+    //   1. poolside/laguna-s-2.1:free — Poolside's coding agent model
+    //      (118B/8B active, 70.2% Terminal-Bench 2.1) — built for exactly
+    //      this workload: multi-file agentic coding in a terminal loop.
+    //   2. thinkingmachines/inkling:free — 975B/41B-active MoE for
+    //      reasoning, coding, and tool-use systems (1M ctx).
+    //   3. nex-agi/nex-n2.5-pro:free — "goals into working, verified
+    //      outcomes" — agentic coding in a visual feedback loop.
+    //   4. nvidia/nemotron-3-ultra-550b-a55b:free — the proven former
+    //      top-of-chain fallback (1M ctx). The lightning/super steps are
+    //      RETIRED from the chain: NVIDIA's free upstreams are the source
+    //      of the live-observed "Upstream timeout exceeded" lane deaths.
+    // The lane cascade rotates on dead slugs and upstream timeouts, so a
+    // future retirement degrades gracefully.
     modelChain.push(
+      "poolside/laguna-s-2.1:free",
+      "thinkingmachines/inkling:free",
+      "nex-agi/nex-n2.5-pro:free",
       "nvidia/nemotron-3-ultra-550b-a55b:free",
-      "nvidia/nemotron-3.5-lightning:free",
-      "nvidia/nemotron-3-super-120b-a12b:free",
     );
   }
   const redis =

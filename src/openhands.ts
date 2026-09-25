@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { config } from "./config.ts";
 import { platformLawText } from "./platform-law.ts";
-import { OpenRouterKeyPool, isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature, type KeyPick } from "./llm/openrouter-pool.ts";
+import { OpenRouterKeyPool, isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature, isOpenRouterUpstreamTimeoutSignature, type KeyPick } from "./llm/openrouter-pool.ts";
 import type { SandboxAdapter } from "./e2b-backblaze/sandbox.ts";
 
 export interface LlmConfig {
@@ -111,7 +111,7 @@ export function resolveLaneLlm(modelIndex: number): { llm: LlmConfig; pick: KeyP
   }
 }
 
-export { isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature };
+export { isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature, isOpenRouterUpstreamTimeoutSignature };
 
 export type OpenHandsEvent =
   | { type: "thinking"; text: string }
