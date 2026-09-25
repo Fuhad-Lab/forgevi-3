@@ -16,7 +16,7 @@
 
 import { config, writeRuntimeConfigFile, reloadEngineConfig } from "../config.ts";
 import { reloadE2BBroker } from "../e2b-backblaze/sandbox.ts";
-import { forgeviTemplate } from "../../e2b-template/template.ts";
+import { forgeviTemplate, TEMPLATE_CPUS, TEMPLATE_MEMORY_MB } from "../../e2b-template/template.ts";
 
 /** THE ALIAS every pooled account's template carries. */
 export const TEMPLATE_ALIAS = "forgevi-3";
@@ -55,7 +55,11 @@ export async function startTemplateSync(): Promise<{
     try {
       // fresh builder per key (the builder carries no key state; the build
       // options carry the apiKey)
-      const info = await Template.buildInBackground(forgeviTemplate, TEMPLATE_ALIAS, { apiKey: key });
+      const info = await Template.buildInBackground(forgeviTemplate, TEMPLATE_ALIAS, {
+        apiKey: key,
+        cpuCount: TEMPLATE_CPUS,
+        memoryMB: TEMPLATE_MEMORY_MB,
+      });
       perKey.push({ keyLabel, buildID: info?.buildID, status: "build-started" });
     } catch (err) {
       perKey.push({

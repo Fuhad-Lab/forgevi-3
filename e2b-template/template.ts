@@ -66,10 +66,22 @@ RUN mkdir -p /opt/forgevi && mkdir -p /workspace && chown user:user /workspace
 WORKDIR /workspace
 `;
 
+/** THE MEMORY LAW (live-verified 2026-09-25): the default sandbox shape
+ *  (2 vCPU / 976MB / no swap) OOM-kills real app builds — Next.js dev +
+ *  build + npm install cannot coexist with the agent binary in under 1GB
+ *  (the live E2E: 49 iterations of solid agentic work, then exit -1 the
+ *  moment `npm install` peaked). The verified free-tier shape — 4 vCPU /
+ *  4096MB — holds the full stack (verified with a spawned test sandbox:
+ *  free reports 3930MB). */
+export const TEMPLATE_CPUS = 4;
+export const TEMPLATE_MEMORY_MB = 4096;
+
 export const forgeviTemplate = Template().fromDockerfile(DOCKERFILE);
 
 if (import.meta.main) {
   const info = await Template.build(forgeviTemplate, "forgevi-3", {
+    cpuCount: TEMPLATE_CPUS,
+    memoryMB: TEMPLATE_MEMORY_MB,
     onBuildLogs: (entry) => {
       const e = entry as { timestamp?: { toISOString?: () => string }; source?: string; message?: string };
       const line = `${e.timestamp?.toISOString?.() ?? ""} [${e.source ?? "build"}] ${e.message ?? JSON.stringify(entry)}`;
