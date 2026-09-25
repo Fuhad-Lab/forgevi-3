@@ -255,7 +255,7 @@ function translateClineRecord(
  *  which fell to the raw-JSON fallback and put a wall of escaped JSON in
  *  the stream row's label. */
 function commandList(input: ClineToolInput): string[] | null {
-  const c = input.commands;
+  const c: unknown = input.commands;
   if (Array.isArray(c)) return c.filter((x): x is string => typeof x === "string");
   if (typeof c === "string" && c.trim()) {
     try {
