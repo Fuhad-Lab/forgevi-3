@@ -282,7 +282,7 @@ function journalEventFor(ev: OpenHandsEvent): JournalEvent | null {
     case "message":
       return { type: "assistant_text", text: ev.text };
     case "action":
-      return { type: "tool_used", tool: ev.tool, status: "ok", detail: ev.detail ?? ev.tool };
+      return { type: "tool_used", tool: ev.tool, status: "ok", detail: ev.detail ?? ev.tool, ...(ev.callId ? { callId: ev.callId } : {}) };
     case "file":
       // THE CODE-STREAM LAW (user fix 2026-09-21): the worker caps and
       // forwards the file BODY — the studio's fragments code panel

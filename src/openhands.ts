@@ -116,7 +116,7 @@ export { isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature };
 export type OpenHandsEvent =
   | { type: "thinking"; text: string }
   | { type: "message"; text: string }
-  | { type: "action"; tool: string; detail?: string }
+  | { type: "action"; tool: string; detail?: string; callId?: string }
   | { type: "file"; path: string; content?: string }
   | { type: "error"; error: string }
   | { type: "finished"; status: "complete" | "incomplete"; summary: string; issues?: string[] };

@@ -186,7 +186,11 @@ function translateClineRecord(
       const input = (ev.input ?? {}) as ClineToolInput;
       if (toolCallId) toolInputs.set(toolCallId, { toolName, input });
       const brief = describeToolInput(toolName, input);
-      out.push({ type: "action", tool: toolName, detail: brief });
+      // THE CALL-MERGE LAW: the start and end of ONE tool call share the
+      // callId — the frontend timeline renders ONE row that updates in
+      // place when the result lands (was: two rows per call, the second
+      // dragging the raw output into its label).
+      out.push({ type: "action", tool: toolName, detail: brief, ...(toolCallId ? { callId: toolCallId } : {}) });
       return out;
     }
 
@@ -207,6 +211,7 @@ function translateClineRecord(
         type: "action",
         tool: toolName,
         detail: `${describeToolInput(toolName, input)} → ${ok ? "ok" : summarizeOutput(output)}`.slice(0, 400),
+        ...(toolCallId ? { callId: toolCallId } : {}),
       });
       return out;
     }
