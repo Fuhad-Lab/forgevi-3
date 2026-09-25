@@ -63,9 +63,20 @@ const VM_CLINE_CONFIG = `${VM_CLINE_DIR}/config`;
 /** Lazy-install prefix for old-template sandboxes — npm's global prefix is
  *  root-owned; a HOME prefix installs without privileges. */
 const VM_CLINE_HOME_BIN = "$HOME/.npm-global/bin/cline";
-/** The cline invocation prefix: the baked PATH binary when present, else
- *  the lazily-installed HOME-prefix binary (old-template sandboxes). */
-const VM_CLINE_CMD = `$(command -v cline >/dev/null 2>&1 && echo cline || echo ${VM_CLINE_HOME_BIN})`;
+/** THE BINARY-RESOLUTION LAW (live-observed 2026-09-25, the rotation-lane
+ *  death): the run exec's shell PATH can disagree with the probe exec's
+ *  (lane 1 ran the baked /usr/local/bin/cline fine; the rotation lane's
+ *  `command -v cline` came up empty and fell to the un-installed HOME
+ *  path → exit 127, run dead). The binary now resolves to an ABSOLUTE
+ *  path with layered fallbacks INSIDE one exec — PATH lookup first, then
+ *  the baked location, then the lazy-install prefix — so no single
+ *  shell-environment quirk can kill a lane. */
+const VM_CLINE_RESOLVE =
+  `__cline=$(command -v cline 2>/dev/null || true); ` +
+  `[ -n "$__cline" ] && [ -x "$__cline" ] || __cline=/usr/local/bin/cline; ` +
+  `[ -x "$__cline" ] || __cline=$HOME/.npm-global/bin/cline; ` +
+  `[ -x "$__cline" ] || { echo "cline binary not found (PATH, /usr/local/bin/cline, $HOME/.npm-global/bin/cline) — the sandbox template is broken" >&2; exit 127; }; ` +
+  `export __cline`;
 
 /** THE CODE-STREAM LAW cap: the file body forwarded per editor event. */
 const FILE_EVENT_CAP = 32 * 1024;
@@ -139,13 +150,14 @@ function bareModel(model: string): string {
 /** Authenticate cline for THIS lane (pooled key + chain model). Persisted
  *  auth is what actually sends the Authorization header (verified: the
  *  `-k` run-flag alone does not). A non-OpenRouter base URL (the NIM
- *  failover lane) rides the openai-compatible provider with `-b`. */
+ *  failover lane) rides the openai-compatible provider with `-b`.
+ *  THE BINARY-RESOLUTION LAW: the same layered resolution guards auth. */
 async function clineAuth(sandbox: SandboxAdapter, llm: LlmConfig, configDir: string): Promise<void> {
   const isVanillaOpenRouter = !llm.baseUrl || /^https:\/\/openrouter\.ai\//i.test(llm.baseUrl);
   const model = bareModel(llm.model);
   const cmd = isVanillaOpenRouter
-    ? `${VM_CLINE_CMD} auth -p openrouter -k '${llm.apiKey}' -m '${model}' --config '${configDir}'`
-    : `${VM_CLINE_CMD} auth -p openai-compatible -k '${llm.apiKey}' -m '${model}' -b '${llm.baseUrl}' --config '${configDir}'`;
+    ? `${VM_CLINE_RESOLVE} && "$__cline" auth -p openrouter -k '${llm.apiKey}' -m '${model}' --config '${configDir}'`
+    : `${VM_CLINE_RESOLVE} && "$__cline" auth -p openai-compatible -k '${llm.apiKey}' -m '${model}' -b '${llm.baseUrl}' --config '${configDir}'`;
   const res = await sandbox.exec(cmd, { timeoutMs: 60_000 });
   if (res.exitCode !== 0) {
     throw new Error(`cline auth failed (exit ${res.exitCode}): ${(res.stdout || res.stderr || "").slice(-300)}`);
@@ -383,9 +395,12 @@ export async function* runCline(opts: ClineRunOpts): AsyncGenerator<OpenHandsEve
       await clineAuth(sandbox, opts.llm, configDir);
       // THE PROMPT-FILE LAW: the task prompt (soul contract included) is
       // passed via command substitution — robust against quotes/newlines/size.
-      // The binary resolves to the baked PATH cline or the lazy HOME prefix.
+      // THE BINARY-RESOLUTION LAW: the run command resolves the cline binary
+      // through the same layered fallback chain as auth — PATH lookup, the
+      // baked /usr/local/bin location, then the lazy-install prefix — so a
+      // shell-PATH disagreement between execs can never kill a lane.
       const runCmd =
-        `${VM_CLINE_CMD} --json --auto-approve true -c '${opts.workspace}' --config '${configDir}' "$(cat '${promptPath}')"; ` +
+        `${VM_CLINE_RESOLVE} && exec "$__cline" --json --auto-approve true -c '${opts.workspace}' --config '${configDir}' "$(cat '${promptPath}')"; ` +
         `__rc=$?; rm -f '${promptPath}'; exit $__rc`;
       const feed = makeFeeder();
       const res = await sandbox.execStream(runCmd, {
