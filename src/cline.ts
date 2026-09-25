@@ -250,13 +250,33 @@ function translateClineRecord(
   return out; // hook_event + unknown records: never break the run
 }
 
+/** The commands of a run_commands input — the models sometimes send the
+ *  array as a JSON-encoded STRING (live-observed: `commands: "[\"npm create…\"]"`),
+ *  which fell to the raw-JSON fallback and put a wall of escaped JSON in
+ *  the stream row's label. */
+function commandList(input: ClineToolInput): string[] | null {
+  const c = input.commands;
+  if (Array.isArray(c)) return c.filter((x): x is string => typeof x === "string");
+  if (typeof c === "string" && c.trim()) {
+    try {
+      const parsed: unknown = JSON.parse(c);
+      if (Array.isArray(parsed)) return parsed.filter((x): x is string => typeof x === "string");
+    } catch {
+      /* a bare command string */
+    }
+    return [c];
+  }
+  return null;
+}
+
 function describeToolInput(toolName: string, input: ClineToolInput): string {
   if (toolName === "editor" && typeof input.path === "string") {
     const kind = typeof input.old_text === "string" ? "edit" : typeof input.insert_line === "number" ? "insert" : "write";
     return `${kind} ${input.path}`;
   }
-  if (toolName === "run_commands" && Array.isArray(input.commands)) {
-    return `$ ${input.commands.join(" && ").slice(0, 200)}`;
+  if (toolName === "run_commands") {
+    const cmds = commandList(input);
+    if (cmds && cmds.length > 0) return `$ ${cmds.join(" && ").slice(0, 200)}`;
   }
   if (toolName === "read_files" && Array.isArray(input.files)) {
     const paths = (input.files as Array<{ path?: string }>).map((f) => f.path).filter(Boolean);
