@@ -45,7 +45,7 @@ import path from "node:path";
 import { config } from "./config.ts";
 import { platformRulesMarkdown } from "./platform-law.ts";
 import type { SandboxAdapter } from "./e2b-backblaze/sandbox.ts";
-import { runOpenHands, type OpenHandsEvent, type LlmConfig, type OpenHandsRunOpts } from "./openhands.ts";
+import { runOpenHands, cleanAgentLogTail, type OpenHandsEvent, type LlmConfig, type OpenHandsRunOpts } from "./openhands.ts";
 
 export type { OpenHandsEvent, LlmConfig };
 
@@ -451,12 +451,16 @@ export async function* runCline(opts: ClineRunOpts): AsyncGenerator<OpenHandsEve
 
   // The agent died without settling — settle honestly.
   if (!sawFinished) {
+    // THE WARNING-FILTER LAW: the tail's deprecation/advisory noise never
+    // reaches the user — the REAL error that killed the lane surfaces (and
+    // feeds the cascade's rotation signatures through the summary).
+    const tail = cleanAgentLogTail(stderrTail);
     yield {
       type: "finished",
       status: "incomplete",
       summary: opts.signal.aborted
         ? "Aborted by the user. Work done so far is saved in the workspace."
-        : `The Cline agent exited (code ${exitCode ?? "?"}) without finishing.${stderrTail ? ` Agent log tail: ${stderrTail.slice(-800)}` : ""}`,
+        : `The Cline agent exited (code ${exitCode ?? "?"}) without finishing.${tail ? ` Agent log tail: ${tail.slice(-800)}` : ""}`,
       issues: opts.signal.aborted ? [] : ["cline exited unexpectedly"],
     };
   }

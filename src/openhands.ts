@@ -15,7 +15,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { config } from "./config.ts";
 import { platformLawText } from "./platform-law.ts";
-import { OpenRouterKeyPool, isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature, isOpenRouterUpstreamTimeoutSignature, type KeyPick } from "./llm/openrouter-pool.ts";
+import {
+  OpenRouterKeyPool,
+  isOpenRouterQuotaSignature,
+  isOpenRouterHardQuotaSignature,
+  isOpenRouterModelUnavailableSignature,
+  isOpenRouterUpstreamTimeoutSignature,
+  isAgentCrashSignature,
+  type KeyPick,
+} from "./llm/openrouter-pool.ts";
+import { loadPoolState, loadProjectLlmKey, redisConfigured, savePoolState } from "./redis.ts";
 import type { SandboxAdapter } from "./e2b-backblaze/sandbox.ts";
 
 export interface LlmConfig {
@@ -24,12 +33,50 @@ export interface LlmConfig {
   baseUrl?: string;
 }
 
-/** THE OPENROUTER POOL (module singleton — round-robin + 429/quota latching). */
+/** THE OPENROUTER POOL (module singleton — round-robin + 429/quota latching
+ *  + THE STICKY-KEY LAW: the last-good key is preferred and the whole
+ *  sticky/cooldown state persists in Redis across engine restarts). */
 export let openrouterPool = new OpenRouterKeyPool(config.openrouterKeys);
 
-/** Rebuild the pool after a config push (the deploy surface calls this). */
+/** Best-effort persistence: every sticky/cooldown change lands in Redis.
+ *  Reads the live module binding so a reload-rebuilt pool stays wired. */
+function wirePoolPersistence(): void {
+  openrouterPool.setPersistSink(() => {
+    if (redisConfigured()) void savePoolState(openrouterPool.snapshot());
+  });
+}
+wirePoolPersistence();
+
+let poolHydrated = false;
+
+/** Restore the persisted pool state (sticky key + cooldowns) — once per
+ *  boot (and once per config-push rebuild). Called at run start BEFORE
+ *  the LLM resolves, so even the first run after a Render restart skips
+ *  the keys that are still cooling down. Best-effort: Redis down = the
+ *  in-memory pool stands as-is. */
+export async function ensureOpenRouterPoolHydrated(): Promise<void> {
+  if (poolHydrated) return;
+  poolHydrated = true;
+  if (!redisConfigured()) return;
+  const state = await loadPoolState();
+  if (state) openrouterPool.restore(state);
+}
+
+/** THE STICKY-KEY LAW, per-project side: prefer this project's remembered
+ *  last-good key for the run about to resolve its LLM. */
+export async function preferProjectLlmKey(projectId: string): Promise<void> {
+  if (!redisConfigured()) return;
+  const key = await loadProjectLlmKey(projectId);
+  if (key) openrouterPool.preferKey(key);
+}
+
+/** Rebuild the pool after a config push (the deploy surface calls this).
+ *  The fresh pool re-hydrates from Redis on the next run (the once-guard
+ *  resets), so persisted cooldowns/stickiness survive the rebuild. */
 export function reloadOpenRouterPool(): void {
   openrouterPool = new OpenRouterKeyPool(config.openrouterKeys);
+  poolHydrated = false;
+  wirePoolPersistence();
 }
 
 export interface LlmResolution {
@@ -71,7 +118,13 @@ export function resolveLlmConfig(): LlmResolution {
   }
   const model = `openai/${config.modelChain[0] ?? "nvidia/nemotron-3-ultra-550b-a55b:free"}`;
   const nvidiaKey = process.env.NVIDIA_API_KEY || process.env.NVIDIA_NIM_API_KEY || undefined;
-  const nvidiaBare = (process.env.NVIDIA_MODEL || "nvidia/nemotron-3.5-lightning-30b-a3b").replace(/^openai\//, "");
+  // THE NIM-MODEL LAW (user report 2026-09-26): the old default
+  // (nemotron-3.5-lightning-30b-a3b) is the live-observed source of the
+  // request timeouts that killed the failover lane ("The operation timed
+  // out", Cline exit -1). The replacement is the direct-NIM bench-verified
+  // coding model (2026-09-02 bench: TTFT 2.3s, 47 tok/s, tool calling 5/5,
+  // coding 11/12) — still overridable via NVIDIA_MODEL.
+  const nvidiaBare = (process.env.NVIDIA_MODEL || "nvidia/nemotron-3-super-120b-a12b").replace(/^openai\//, "");
   return {
     ok: true,
     llm: {
@@ -111,7 +164,13 @@ export function resolveLaneLlm(modelIndex: number): { llm: LlmConfig; pick: KeyP
   }
 }
 
-export { isOpenRouterQuotaSignature, isOpenRouterModelUnavailableSignature, isOpenRouterUpstreamTimeoutSignature };
+export {
+  isOpenRouterQuotaSignature,
+  isOpenRouterHardQuotaSignature,
+  isOpenRouterModelUnavailableSignature,
+  isOpenRouterUpstreamTimeoutSignature,
+  isAgentCrashSignature,
+};
 
 export type OpenHandsEvent =
   | { type: "thinking"; text: string }
@@ -367,10 +426,30 @@ export async function* runOpenHands(opts: OpenHandsRunOpts): AsyncGenerator<Open
       status: "incomplete",
       summary: opts.signal.aborted
         ? "Aborted by the user. Work done so far is saved in the workspace."
-        : `The OpenHands worker exited (code ${exitCode ?? "?"}) without finishing.${stderrTail ? ` Worker log tail: ${stderrTail.slice(-800)}` : ""}`,
+        : `The OpenHands worker exited (code ${exitCode ?? "?"}) without finishing.${stderrTail ? ` Worker log tail: ${cleanAgentLogTail(stderrTail).slice(-800)}` : ""}`,
       issues: opts.signal.aborted ? [] : ["worker exited unexpectedly"],
     };
   }
+}
+
+/** THE WARNING-FILTER LAW (user report 2026-09-26): the agent binary's
+ *  stderr floods with deprecation/advisory warnings (every request logs
+ *  the AI SDK providerOptions advisory) — they bury the REAL error that
+ *  killed the lane. Warning lines never reach the honest tail. */
+export function cleanAgentLogTail(tail: string): string {
+  return tail
+    .split("\n")
+    .filter((line) => {
+      const s = line.trim();
+      return (
+        s !== "" &&
+        !s.startsWith("Warning:") &&
+        !s.includes("DeprecationWarning") &&
+        !s.includes("ExperimentalWarning") &&
+        !s.includes("AI SDK Warning")
+      );
+    })
+    .join("\n");
 }
 
 // ── capability probe (for /health) ──────────────────────────────────────

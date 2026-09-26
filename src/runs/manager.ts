@@ -24,12 +24,17 @@ import {
 import {
   resolveLlmConfig,
   resolveLaneLlm,
+  ensureOpenRouterPoolHydrated,
+  preferProjectLlmKey,
   isOpenRouterQuotaSignature,
+  isOpenRouterHardQuotaSignature,
   isOpenRouterModelUnavailableSignature,
   isOpenRouterUpstreamTimeoutSignature,
+  isAgentCrashSignature,
   type LlmConfig,
   type OpenHandsEvent,
 } from "../openhands.ts";
+import type { KeyPick } from "../llm/openrouter-pool.ts";
 // THE AGENT-LANE LAW (2026-09-23): runAgent dispatches to the Cline CLI
 // (the new default in-VM agent) with the OpenHands worker as the automatic
 // fallback — the event vocabulary is identical, everything downstream is
@@ -46,6 +51,7 @@ import {
   loadProjectChat,
   mergeChatHistories,
   redisConfigured,
+  saveProjectLlmKey,
 } from "../redis.ts";
 
 export interface StartRunInput {
@@ -275,6 +281,31 @@ interface OpenHandsOutcome {
   actions: number;
 }
 
+/** THE OUTCOME-REPORTING LAW (user mandate 2026-09-26): the lane's pool
+ *  pick hears the TRUTH. A lane that died on the hard-quota signature
+ *  latches a rest-of-day cooldown on its key (the pool silently skips it,
+ *  and Redis carries the cooldown across engine restarts); a 429 latches
+ *  the short cooldown; anything else leaves the key eligible — and a
+ *  genuinely good lane crowns its key STICKY (THE STICKY-KEY LAW). The
+ *  old code called reportSuccess() unconditionally, so an exhausted key
+ *  never cooled down and the rotation looked like a pipeline. */
+function reportLaneOutcome(pick: KeyPick | undefined, outcome: OpenHandsOutcome | null): void {
+  if (!pick) return;
+  if (!outcome || outcome.status === "complete") {
+    pick.reportSuccess();
+    return;
+  }
+  const signature = `${outcome.summary} ${outcome.remainingIssues.join(" ")}`;
+  if (isOpenRouterHardQuotaSignature(signature)) {
+    pick.reportQuotaExhaustion(signature.slice(0, 200));
+  } else if (/\b429\b|rate limit exceeded/i.test(signature)) {
+    pick.report429();
+  } else {
+    // model-level / crash / unknown lane failure — the key is likely fine
+    pick.reportSuccess();
+  }
+}
+
 /** Map an OpenHands worker event onto the Forgvi journal vocabulary. */
 function journalEventFor(ev: OpenHandsEvent): JournalEvent | null {
   switch (ev.type) {
@@ -414,6 +445,14 @@ async function executeRun(
       });
     }
 
+    // THE STICKY-KEY LAW (user mandate 2026-09-26): restore the pool's
+    // persisted state (last-good key + active cooldowns — survives the
+    // engine's Render restarts) and prefer THIS project's remembered key,
+    // so the follow-up message continues on the key the AI settled on
+    // instead of marching from key #1 through every exhausted key again.
+    await ensureOpenRouterPoolHydrated();
+    if (workspaceKey) await preferProjectLlmKey(workspaceKey);
+
     const llmResult = getLlmConfig();
     if (!llmResult.ok || !llmResult.llm) {
       throw new Error(llmResult.error || "the engine has no LLM configured");
@@ -476,6 +515,13 @@ async function executeRun(
       })) {
         if (ev.type === "error") {
           laneErrors.push(ev.error.slice(0, 400));
+          // THE SILENT-EXHAUSTION LAW (user mandate 2026-09-26): a key's
+          // credit running out is POOL PLUMBING, never a user-facing log —
+          // the error is collected for the cascade (rotation decision +
+          // key cooldown latching) but the stream never renders it.
+          if (!isOpenRouterQuotaSignature(ev.error)) {
+            emit({ type: "tool_used", tool: "agent", status: "error", detail: ev.error });
+          }
         }
         if (ev.type === "finished") {
           laneOutcome = {
@@ -506,7 +552,7 @@ async function executeRun(
           actions += 1;
           counters.steps.add(1);
           emit(journalEventFor(ev) ?? { type: "tool_used", tool: ev.tool, status: "ok" }, { iteration: actions });
-        } else {
+        } else if (ev.type !== "error") {
           const event = journalEventFor(ev);
           if (event) emit(event);
         }
@@ -515,27 +561,43 @@ async function executeRun(
     };
 
     outcome = await runLane(llmResult.llm);
-    llmResult.pick?.reportSuccess();
+    reportLaneOutcome(llmResult.pick, outcome);
+    // THE STICKY-KEY LAW, per-project remember: the key that just served
+    // a COMPLETE lane is this project's go-to key for the next message.
+    if (workspaceKey && outcome?.status === "complete" && llmResult.pick) {
+      void saveProjectLlmKey(workspaceKey, llmResult.pick.apiKey);
+    }
 
     // THE KEY-POOL CASCADE: when the lane died with the quota/429 signature
     // (a key's free tier is exhausted), the model-unavailable signature
     // (a retired/dead slug — live-observed: OpenRouter retired
-    // qwen3-coder:free mid-run), OR the upstream-timeout signature
+    // qwen3-coder:free mid-run), the upstream-timeout signature
     // (live-observed 2026-09-25: "Upstream timeout exceeded" — OpenRouter's
-    // own proxy deadline against a loaded free upstream; NOT an engine-set
-    // timeout), rotate to the NEXT pooled key + next model in the chain —
-    // announced in the stream, never silent. The NVIDIA NIM lane remains
-    // the final failover when configured.
+    // own proxy deadline against a loaded free upstream; user report
+    // 2026-09-26: "The operation timed out" — the request-level timeout
+    // inside the agent binary; neither is a limit the engine sets), OR the
+    // crash signature (live-observed: the Cline binary dying outright,
+    // exit code -1 — THE CRASH-RECOVERY LAW), rotate to the next pooled
+    // key + next model in the chain. THE SILENT-EXHAUSTION LAW: when the
+    // failure is a KEY's credit running out, the rotation says NOTHING —
+    // no stream row, no log; model-level causes still announce (the lane's
+    // model visibly changed). The NVIDIA NIM lane remains the final
+    // failover when configured.
     if (outcome && !abort.signal.aborted) {
+      const outcomeSignature = (o: OpenHandsOutcome | null): string =>
+        o ? `${o.summary} ${o.remainingIssues.join(" ")}` : "";
       const rotatable = (o: OpenHandsOutcome | null): boolean => {
         if (!o || o.status !== "incomplete") return false;
-        const signature = `${o.summary} ${o.remainingIssues.join(" ")}`;
+        const signature = outcomeSignature(o);
         return (
           isOpenRouterQuotaSignature(signature) ||
           isOpenRouterModelUnavailableSignature(signature) ||
-          isOpenRouterUpstreamTimeoutSignature(signature)
+          isOpenRouterUpstreamTimeoutSignature(signature) ||
+          isAgentCrashSignature(signature)
         );
       };
+      const keyQuotaFailure = (o: OpenHandsOutcome | null): boolean =>
+        Boolean(o && o.status === "incomplete" && isOpenRouterQuotaSignature(outcomeSignature(o)));
       let rotate = rotatable(outcome);
       let laneIdx = 1;
       while (
@@ -545,14 +607,19 @@ async function executeRun(
       ) {
         const lane = resolveLaneLlm(laneIdx);
         if (!lane) break; // the pool is exhausted — fall through to NIM
-        emit({
-          type: "tool_used",
-          tool: "engine",
-          status: "ok",
-          detail: `OpenRouter lane failed (${llmResult.modelChain[laneIdx - 1] ?? "primary"}) — rotating to the next pooled key + model: ${llmResult.modelChain[laneIdx]}`,
-        });
+        if (!keyQuotaFailure(outcome)) {
+          emit({
+            type: "tool_used",
+            tool: "engine",
+            status: "ok",
+            detail: `OpenRouter lane failed (${llmResult.modelChain[laneIdx - 1] ?? "primary"}) — rotating to the next pooled key + model: ${llmResult.modelChain[laneIdx]}`,
+          });
+        }
         outcome = await runLane(lane.llm);
-        lane.pick.reportSuccess();
+        reportLaneOutcome(lane.pick, outcome);
+        if (workspaceKey && outcome?.status === "complete") {
+          void saveProjectLlmKey(workspaceKey, lane.pick.apiKey);
+        }
         laneIdx += 1;
         rotate = rotatable(outcome);
       }

@@ -113,6 +113,67 @@ export async function loadProjectChat(projectId: string): Promise<CachedChatRow[
   return rows;
 }
 
+// ── the LLM key-pool state (THE STICKY-KEY LAW) ─────────────────────────
+//
+// The OpenRouter pool's sticky key + key cooldowns persist here so they
+// survive the engine's Render restarts (every deploy resets in-memory
+// pool state — without this, the next message after a restart marches
+// from key #1 through every exhausted key again). Best-effort by the
+// same law as everything else in this file: a Redis outage degrades to
+// in-memory-only behavior, never a hard failure.
+
+const POOL_STATE_KEY = "forgeyn:llm:poolstate";
+const PROJECT_LLM_KEY_TTL_S = 7 * 24 * 60 * 60; // a week — credit resets long before this
+
+export interface PersistedPoolState {
+  stickyKey: string | null;
+  cooldowns: { key: string; until: number }[];
+}
+
+/** Persist the pool's sticky key + active cooldowns (best-effort). */
+export async function savePoolState(state: PersistedPoolState): Promise<void> {
+  await redisCommand(["SET", POOL_STATE_KEY, JSON.stringify(state)]);
+}
+
+/** Load the persisted pool state (null when unconfigured/down/absent). */
+export async function loadPoolState(): Promise<PersistedPoolState | null> {
+  const raw = await redisCommand<string>(["GET", POOL_STATE_KEY]);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as PersistedPoolState;
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      stickyKey: typeof parsed.stickyKey === "string" ? parsed.stickyKey : null,
+      cooldowns: Array.isArray(parsed.cooldowns)
+        ? parsed.cooldowns
+            .filter(
+              (c): c is { key: string; until: number } =>
+                Boolean(c) && typeof (c as { key?: unknown }).key === "string" && Number.isFinite((c as { until?: unknown }).until),
+            )
+            .map((c) => ({ key: c.key, until: Number(c.until) }))
+        : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function projectLlmKey(projectId: string): string {
+  return `forgeyn:project:${projectId}:llmkey`;
+}
+
+/** Remember the project's last-good OpenRouter key (full string) — the
+ *  next run for THIS project prefers it (per-project stickiness). */
+export async function saveProjectLlmKey(projectId: string, apiKey: string): Promise<void> {
+  await redisCommand(["SET", projectLlmKey(projectId), apiKey, "EX", PROJECT_LLM_KEY_TTL_S]);
+}
+
+/** Load the project's last-good key (null when unconfigured/down/absent). */
+export async function loadProjectLlmKey(projectId: string): Promise<string | null> {
+  const raw = await redisCommand<string>(["GET", projectLlmKey(projectId)]);
+  return typeof raw === "string" && raw.trim() ? raw : null;
+}
+
 // ── the journal-frame cache (per run) ───────────────────────────────────
 
 const EVENTS_CAP = 800;
