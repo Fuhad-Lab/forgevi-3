@@ -58,7 +58,7 @@ import { redisConfigured } from "./redis.ts";
 import { loadRunEvents } from "./redis.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
 
-const VERSION = "3.2.9";
+const VERSION = "3.3.0";
 const KERNEL = "cline+openhands";
 
 const ALLOWED_ORIGINS = new Set([
@@ -171,11 +171,13 @@ async function sseResponse(runId: string, since: number, origin: string | null):
 /** THE CATCH-UP LAW, dead-run replay: the engine lost the in-memory journal
  *  but Redis holds every frame it emitted (capped at the last 800). Replay
  *  the frames past `since`; when the run died mid-flight with the restart
- *  (no run_finished frame in the cache), append ONE synthetic terminal
- *  frame so the client settles honestly with the full partial stream
- *  visible. An empty replay set (the cursor already past everything, e.g.
- *  a browser auto-reconnect after the settle) sends only forge-close — a
- *  synthetic terminal on every reconnect would re-fire finishForgviRun. */
+ *  (no run_finished frame ANYWHERE in the cache), append ONE synthetic
+ *  terminal frame so the client settles honestly with the full partial
+ *  stream visible — even when the replay set itself is EMPTY (the client's
+ *  journal prefetch may have consumed every cached frame already; the
+ *  settle signal must still arrive). The synthetic is emitted at most once
+ *  per run per engine process so browser auto-reconnects can't re-fire it. */
+const settledSyntheticRunIds = new Set<string>();
 function cachedReplayResponse(runId: string, cached: unknown[], since: number, origin: string | null): Response {
   const encoder = new TextEncoder();
   const frames = cached.filter((f): f is JournalEnvelope => {
@@ -183,11 +185,16 @@ function cachedReplayResponse(runId: string, cached: unknown[], since: number, o
     const seq = Number((f as { seq?: unknown }).seq);
     return Number.isFinite(seq) && seq > since;
   });
-  const lastFrame = frames.length > 0 ? frames[frames.length - 1] ?? null : null;
-  const settled =
-    lastFrame !== null &&
-    (lastFrame as { event?: { type?: unknown } }).event?.type === "run_finished";
-  const lastSeq = lastFrame !== null ? Number(lastFrame.seq) || since : since;
+  // the CACHE's last frame (unfiltered) decides whether the run ever
+  // settled — the filtered replay set alone would miss the case where the
+  // client's prefetch already consumed every frame.
+  const lastCached = cached.length > 0 ? cached[cached.length - 1] ?? null : null;
+  const cacheSettled =
+    lastCached !== null &&
+    (lastCached as { event?: { type?: unknown } }).event?.type === "run_finished";
+  const lastSeq = frames.length > 0 ? Number(frames[frames.length - 1]!.seq) || since : since;
+  const appendSynthetic = !cacheSettled && !settledSyntheticRunIds.has(runId);
+  if (appendSynthetic) settledSyntheticRunIds.add(runId);
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const send = (chunk: string) => {
@@ -199,7 +206,7 @@ function cachedReplayResponse(runId: string, cached: unknown[], since: number, o
       };
       send("retry: 3000\n\n");
       for (const frame of frames) send(`data: ${JSON.stringify(frame)}\n\n`);
-      if (frames.length > 0 && !settled) {
+      if (appendSynthetic) {
         const terminal: JournalEnvelope = {
           seq: lastSeq + 1,
           ts: Date.now(),
