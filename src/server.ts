@@ -58,7 +58,7 @@ import { redisConfigured } from "./redis.ts";
 import { loadRunEvents } from "./redis.ts";
 import type { JournalEnvelope } from "./runs/journal.ts";
 
-const VERSION = "3.2.7";
+const VERSION = "3.2.8";
 const KERNEL = "cline+openhands";
 
 const ALLOWED_ORIGINS = new Set([
@@ -101,10 +101,21 @@ function notFound(origin: string | null): Response {
 
 const PING_INTERVAL_MS = 15_000;
 
-/** SSE stream: replay (seq > since) → live → forge-close → end. */
-function sseResponse(runId: string, since: number, origin: string | null): Response {
+/** SSE stream: replay (seq > since) → live → forge-close → end.
+ *
+ * THE CATCH-UP LAW (user fix 2026-09-26): a journal that is no longer in
+ * memory (engine restart / Render spin-down mid-run) used to 404 here —
+ * the events that happened while the user was away NEVER appeared on
+ * reload even though every frame was cached in Redis as it was emitted.
+ * The fallback replays the surviving cache, appends an honest terminal
+ * frame when the run died without one, and closes. */
+async function sseResponse(runId: string, since: number, origin: string | null): Promise<Response> {
   const journal = getRunJournal(runId);
-  if (!journal) return notFound(origin);
+  if (!journal) {
+    const cached = await loadRunEvents(runId);
+    if (!cached || cached.length === 0) return notFound(origin);
+    return cachedReplayResponse(runId, cached, since, origin);
+  }
   const encoder = new TextEncoder();
   const replay = journal.framesSince(since);
   const lastSeq = replay.length > 0 ? replay[replay.length - 1]!.seq : since;
@@ -152,6 +163,78 @@ function sseResponse(runId: string, since: number, origin: string | null): Respo
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
+      ...corsHeaders(origin),
+    },
+  });
+}
+
+/** THE CATCH-UP LAW, dead-run replay: the engine lost the in-memory journal
+ *  but Redis holds every frame it emitted (capped at the last 800). Replay
+ *  the frames past `since`; when the run died mid-flight with the restart
+ *  (no run_finished frame in the cache), append ONE synthetic terminal
+ *  frame so the client settles honestly with the full partial stream
+ *  visible. An empty replay set (the cursor already past everything, e.g.
+ *  a browser auto-reconnect after the settle) sends only forge-close — a
+ *  synthetic terminal on every reconnect would re-fire finishForgviRun. */
+function cachedReplayResponse(runId: string, cached: unknown[], since: number, origin: string | null): Response {
+  const encoder = new TextEncoder();
+  const frames = cached.filter((f): f is JournalEnvelope => {
+    if (!f || typeof f !== "object") return false;
+    const seq = Number((f as { seq?: unknown }).seq);
+    return Number.isFinite(seq) && seq > since;
+  });
+  const lastFrame = frames.length > 0 ? frames[frames.length - 1] ?? null : null;
+  const settled =
+    lastFrame !== null &&
+    (lastFrame as { event?: { type?: unknown } }).event?.type === "run_finished";
+  const lastSeq = lastFrame !== null ? Number(lastFrame.seq) || since : since;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const send = (chunk: string) => {
+        try {
+          controller.enqueue(encoder.encode(chunk));
+        } catch {
+          /* reader gone */
+        }
+      };
+      send("retry: 3000\n\n");
+      for (const frame of frames) send(`data: ${JSON.stringify(frame)}\n\n`);
+      if (frames.length > 0 && !settled) {
+        const terminal: JournalEnvelope = {
+          seq: lastSeq + 1,
+          ts: Date.now(),
+          id: crypto.randomUUID(),
+          runId,
+          sessionId: "recovered",
+          event: {
+            type: "run_finished",
+            status: "incomplete",
+            summary:
+              "The engine restarted mid-run — everything built so far is saved in your workspace (check the Files tab). This stream is the work that completed.",
+            verificationScore: 0,
+            iterations: 0,
+            durationMs: 0,
+            remainingIssues: [],
+          },
+        };
+        send(`data: ${JSON.stringify(terminal)}\n\n`);
+      }
+      send("event: forge-close\ndata: closed\n\n");
+      try {
+        controller.close();
+      } catch {
+        /* already closed */
+      }
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+      "X-Forgevi-Journal": "redis-replay",
       ...corsHeaders(origin),
     },
   });
@@ -493,7 +576,7 @@ const server = Bun.serve({
     const eventsMatch = /^\/runs\/([^/]+)\/events$/.exec(path);
     if (eventsMatch && request.method === "GET") {
       const since = Number(url.searchParams.get("since") ?? "0");
-      return sseResponse(eventsMatch[1]!, Number.isFinite(since) && since >= 0 ? Math.floor(since) : 0, origin);
+      return await sseResponse(eventsMatch[1]!, Number.isFinite(since) && since >= 0 ? Math.floor(since) : 0, origin);
     }
 
     const abortMatch = /^\/runs\/([^/]+)\/abort$/.exec(path);
@@ -724,3 +807,24 @@ const server = Bun.serve({
 console.error(
   `[forgevi-3] listening on :${server.port} — kernel=${KERNEL} sandbox=${config.e2bKeys.length > 0 ? `e2b-pool(${config.e2bKeys.length} keys)` : "local"} storage=${config.b2 ? "backblaze-b2" : "local-disk"} redis=${redisConfigured() ? "upstash" : "none"} openrouter-keys=${config.openrouterKeys.length} version=${VERSION}`,
 );
+
+// ── THE KEEP-AWAKE LAW (user fix 2026-09-26) ─────────────────────────────
+// Render's free tier spins the service down after ~15 minutes without
+// INBOUND traffic — and the only inbound stream is the user's browser. Walk
+// away mid-run and the engine (and with it the run, its execStream to the
+// sandbox, and the in-memory journal) died silently ~15 minutes later: the
+// user returned to a partial stream that never caught up. While ANY run is
+// in flight the engine pings its own public /health every 4 minutes — runs
+// now survive an absent user; an idle engine still sleeps (free-tier kind).
+{
+  const external = process.env.RENDER_EXTERNAL_URL;
+  if (external) {
+    const timer = setInterval(() => {
+      if (activeRunCount() === 0) return;
+      void fetch(`${external.replace(/\/+$/, "")}/health`, { signal: AbortSignal.timeout(10_000) })
+        .then(() => undefined)
+        .catch(() => undefined);
+    }, 4 * 60_000);
+    timer.unref?.();
+  }
+}
